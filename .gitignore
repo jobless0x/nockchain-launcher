@@ -1,0 +1,35 @@
+
+# Environment files
+.env
+*.env
+
+# Miner state and runtime data
+miner*/
+state.jam
+*.log
+
+# Logs and exports
+*.log
+*.out
+*.err
+keys.export
+update.log
+build.log
+
+# Compiled binaries
+target/
+*.o
+*.so
+*.a
+*.dylib
+
+# System files
+.DS_Store
+Thumbs.db
+
+# VSCode
+.vscode/
+
+# Python cache
+__pycache__/
+*.pyc
