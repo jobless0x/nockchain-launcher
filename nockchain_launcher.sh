@@ -93,6 +93,22 @@ echo -e "${YELLOW}:: Powered by Jobless ::${RESET}"
 
 # Display launcher ASCII art, branding, and welcome text
 echo -e "${DIM}Welcome to the Nockchain Node Manager.${RESET}"
+
+# Extract network height from all miner logs (for dashboard)
+NETWORK_HEIGHT="--"
+all_blocks=()
+for miner_dir in "$HOME/nockchain"/miner*; do
+  [[ -d "$miner_dir" ]] || continue
+  log_file="$miner_dir/$(basename "$miner_dir").log"
+  if [[ -f "$log_file" ]]; then
+    height=$(grep -a 'heard block' "$log_file" | tail -n 5 | grep -oP 'height\s+\K[0-9]+\.[0-9]+' | sort -V | tail -n 1)
+    [[ -n "$height" ]] && all_blocks+=("$height")
+  fi
+done
+if [[ ${#all_blocks[@]} -gt 0 ]]; then
+  NETWORK_HEIGHT=$(printf "%s\n" "${all_blocks[@]}" | sort -V | tail -n 1)
+fi
+
 echo -e "${DIM}Install, configure, and monitor multiple Nockchain miners with ease.${RESET}"
 echo ""
 
@@ -150,6 +166,7 @@ if [[ -d "$HOME/nockchain" ]]; then
 else
   printf "  ${CYAN}%-12s${RESET}%b\n" "Public Key:" "${YELLOW}(not available)${RESET}"
 fi
+printf "  ${CYAN}%-12s${RESET}%-20s\n" "Height:" "$NETWORK_HEIGHT"
 echo ""
 
 # Show live system metrics: CPU load, memory usage, uptime
@@ -757,23 +774,52 @@ case "$USER_CHOICE" in
     ;;
   8)
     clear
-    echo -e "${DIM}Legend:${RESET} ${YELLOW}🟡 <5m${RESET} | ${CYAN}🔵 <30m${RESET} | ${GREEN}🟢 Stable >30m${RESET} | ${DIM}${RED}❌ Inactive${RESET}"
-    echo ""
-    printf "%-2s %-10s %-6s | %-9s %-9s\n" "" "Miner" "Uptime" "CPU (%)" "MEM (%)"
-    all_miners=()
-    for miner_dir in "$HOME/nockchain"/miner*; do
-      [ -d "$miner_dir" ] || continue
-      all_miners+=("$(basename "$miner_dir")")
-    done
-    IFS=$'\n' sorted_miners=($(printf "%s\n" "${all_miners[@]}" | sort -V))
-    unset IFS
-    if [[ ${#sorted_miners[@]} -eq 0 ]]; then
-      echo -e "${YELLOW}No miners found.${RESET}"
-    else
+    while true; do
+      # Extract network height from all miner logs (live, every refresh)
+      NETWORK_HEIGHT="--"
+      all_blocks=()
+      for miner_dir in "$HOME/nockchain"/miner*; do
+        [[ -d "$miner_dir" ]] || continue
+        log_file="$miner_dir/$(basename "$miner_dir").log"
+        if [[ -f "$log_file" ]]; then
+          height=$(grep -a 'heard block' "$log_file" | tail -n 5 | grep -oP 'height\s+\K[0-9]+\.[0-9]+' | sort -V | tail -n 1)
+          [[ -n "$height" ]] && all_blocks+=("$height")
+        fi
+      done
+      if [[ ${#all_blocks[@]} -gt 0 ]]; then
+        NETWORK_HEIGHT=$(printf "%s\n" "${all_blocks[@]}" | sort -V | tail -n 1)
+      fi
+      tput cup 0 0
+      echo -e "${DIM}🖥️  Live Miner Monitor ${RESET}"
+      echo ""
+      echo -e "${DIM}Legend:${RESET} ${YELLOW}🟡 <5m${RESET} | ${CYAN}🔵 <30m${RESET} | ${GREEN}🟢 Stable >30m${RESET} | ${DIM}${RED}❌ Inactive${RESET}"
+      echo ""
+      echo -e "${CYAN}📡 Network height: ${RESET}$NETWORK_HEIGHT"
+      echo ""
+      printf "   | %-9s | %-9s | %-9s | %-9s | %-9s | %-5s | %-10s | %-5s\n" "Miner" "Uptime" "CPU (%)" "MEM (%)" "Block" "Lag" "Status" "Peers"
+
+      all_miners=()
+      for miner_dir in "$HOME/nockchain"/miner*; do
+        [ -d "$miner_dir" ] || continue
+        all_miners+=("$(basename "$miner_dir")")
+      done
+      IFS=$'\n' sorted_miners=($(printf "%s\n" "${all_miners[@]}" | sort -V))
+      unset IFS
+      if [[ ${#sorted_miners[@]} -eq 0 ]]; then
+        echo -e "${YELLOW}No miners found or unable to read data.${RESET}"
+        echo -e "${YELLOW}Press Enter to return to menu...${RESET}"
+        read
+        break
+      fi
+
       for session in "${sorted_miners[@]}"; do
+        miner_dir="$HOME/nockchain/$session"
+        log_file="$miner_dir/$session.log"
+
         if tmux has-session -t "$session" 2>/dev/null; then
           pane_pid=$(tmux list-panes -t "$session" -F "#{pane_pid}" 2>/dev/null)
           miner_pid=$(pgrep -P "$pane_pid" -f nockchain | head -n 1)
+
           readable="--"
           if [[ -n "$miner_pid" && -r "/proc/$miner_pid/stat" ]]; then
             proc_start_ticks=$(awk '{print $22}' /proc/$miner_pid/stat)
@@ -787,6 +833,7 @@ case "$USER_CHOICE" in
             readable="${minutes}m"
             (( hours > 0 )) && readable="${hours}h ${minutes}m"
           fi
+
           if [[ "$readable" =~ ^([0-9]+)m$ ]]; then
             diff=${BASH_REMATCH[1]}
             if (( diff < 5 )); then
@@ -801,6 +848,7 @@ case "$USER_CHOICE" in
           else
             color="${YELLOW}🟡"
           fi
+
           if [[ -n "$miner_pid" ]]; then
             cpu_mem=$(ps -p "$miner_pid" -o %cpu,%mem --no-headers)
             cpu=$(echo "$cpu_mem" | awk '{print $1}')
@@ -809,17 +857,51 @@ case "$USER_CHOICE" in
             cpu="?"
             mem="?"
           fi
-          printf "%b %-10b %-6s | %-9s %-9s\n" "$color" "$session" "$readable" "$cpu%" "$mem%"
+
+          if [[ -f "$log_file" ]]; then
+            latest_block=$(grep -a 'added to validated blocks at' "$log_file" 2>/dev/null | tail -n 1 | grep -oP 'at\s+\K[0-9]+\.[0-9]+' || echo "--")
+          else
+            latest_block="--"
+          fi
+
+          # Peer count from tmux buffer
+          peer_count=$(tmux capture-pane -p -t "$session" | grep 'connected_peers=' | tail -n 1 | grep -o 'connected_peers=[0-9]\+' | cut -d= -f2)
+          [[ -z "$peer_count" ]] && peer_count="--"
+
+          # Lag logic
+          if [[ "$latest_block" =~ ^[0-9]+\.[0-9]+$ && "$NETWORK_HEIGHT" =~ ^[0-9]+\.[0-9]+$ ]]; then
+            miner_block=$(echo "$latest_block" | awk -F. '{print ($1 * 1000 + $2)}')
+            network_block=$(echo "$NETWORK_HEIGHT" | awk -F. '{print ($1 * 1000 + $2)}')
+            lag_int=$((network_block - miner_block))
+            (( lag_int < 0 )) && lag_int=0
+            lag="$lag_int"
+          else
+            lag="--"
+            lag_int=0
+          fi
+
+          if [[ "$lag" =~ ^[0-9]+$ && "$lag_int" -eq 0 ]]; then
+            lag_status="⛏️ mining "
+            lag_color="${GREEN}"
+          else
+            lag_status="⏳ syncing"
+            lag_color="${YELLOW}"
+          fi
+
+          printf "%b | %-9s | %-9s | %-9s | %-9s | %-9s | %-5s | %-10b | %-5s\n" "$color" "$session" "$readable" "$cpu%" "$mem%" "$latest_block" "$lag" "$(echo -e "$lag_color$lag_status$RESET")" "$peer_count"
         else
-          DIMGRAY="\e[2;90m"
-          RESET="\e[0m"
-          printf "${DIMGRAY}❌ %-10s %-6s | %-9s %-9s${RESET}\n" "$session" "--" "--" "--"
+          # Show default values for inactive/broken miners
+          printf "${DIM}❌ | %-9s | %-9s | %-9s | %-9s | %-9s | %-5s | %-10s | %-5s${RESET}\n" "$session" "--" "--" "--" "--" "--" "inactive" "--"
         fi
       done
-    fi
-    echo ""
-    echo -e "${YELLOW}Press any key to return to the main menu...${RESET}"
-    read -n 1 -s
+
+      echo ""
+      echo -e "${DIM}Refreshing every 2s — press ${BOLD_BLUE}Enter${DIM} to exit.${RESET}"
+      key=""
+      if read -t 2 -s -r key 2>/dev/null; then
+        [[ "$key" == "" ]] && break  # Enter pressed
+      fi
+    done
     continue
     ;;
   9)
