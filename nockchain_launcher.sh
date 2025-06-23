@@ -25,23 +25,22 @@ start_miner_tmux() {
   local session=$1
   local dir=$2
   local key=$3
-  local use_state=$4
-  local log_file="$dir/$session.log"
 
-  # Prevent launching if the miner's tmux session is already running
   if tmux has-session -t "$session" 2>/dev/null; then
     echo -e "${YELLOW}⚠️  Skipping $session: tmux session already exists.${RESET}"
     return
   fi
 
-  local state_flag=""
-  [[ "$use_state" =~ ^[Yy]$ ]] && state_flag="--state-jam ../state.jam"
+  cd "$dir"
+  bash "$SCRIPT_DIR/start_miner.sh" "$dir" "$key"
 
-  tmux new-session -d -s "$session" "cd $dir && \
-RUST_LOG=info,nockchain=info,nockchain_libp2p_io=info,libp2p=info,libp2p_quic=info \
-MINIMAL_LOG_FORMAT=true \
-$HOME/nockchain/target/release/nockchain --mine \
---mining-pubkey $key $state_flag | tee $log_file"
+  sleep 0.5
+
+  if tmux has-session -t "$session" 2>/dev/null; then
+    echo -e "${GREEN}✅ $session is running in tmux session '$session'.${RESET}"
+  else
+    echo -e "${RED}❌ Failed to launch $session. Tmux session not found.${RESET}"
+  fi
 }
 
 # Calculate uptime of a running tmux miner session (formatted as h/m)
@@ -67,6 +66,8 @@ NCK_DIR="$HOME/nockchain"
 NCK_BIN="$NCK_DIR/target/release/nockchain"
 
 SCRIPT_PATH="$(realpath "$0")"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CONFIG_FILE="$SCRIPT_DIR/launch.cfg"
 LAUNCHER_VERSION_FILE="$(dirname "$SCRIPT_PATH")/NOCKCHAIN_LAUNCHER_VERSION"
 if [[ -f "$LAUNCHER_VERSION_FILE" ]]; then
   LAUNCHER_VERSION=$(cat "$LAUNCHER_VERSION_FILE" | tr -d '[:space:]')
@@ -327,7 +328,11 @@ case "$USER_CHOICE" in
 
     echo -e "${YELLOW}⚠️  This will install Nockchain from scratch. This may overwrite existing files.${RESET}"
     echo -e "${YELLOW}Are you sure you want to continue? (y/n)${RESET}"
-    read -rp "$(echo -e "${BOLD_BLUE}> ${RESET}")" CONFIRM_INSTALL
+    while true; do
+      read -rp "$(echo -e "${BOLD_BLUE}> ${RESET}")" CONFIRM_INSTALL
+      [[ "$CONFIRM_INSTALL" =~ ^[YyNn]$ ]] && break
+      echo -e "${RED}❌ Please enter y or n.${RESET}"
+    done
     if [[ ! "$CONFIRM_INSTALL" =~ ^[Yy]$ ]]; then
       echo -e "${CYAN}Returning to menu...${RESET}"
       continue
@@ -374,7 +379,11 @@ case "$USER_CHOICE" in
         echo -e "${YELLOW}>> To monitor build: ${DIM}screen -r nockbuild${RESET}"
         echo -e "${DIM}Tip: Press ${CYAN}Ctrl+A${DIM}, then ${CYAN}D${DIM} to detach from the screen without stopping the build.${RESET}"
         echo -e "${YELLOW}Would you like to attach to the build screen session now? (y/n)${RESET}"
-        read -rp "$(echo -e "${BOLD_BLUE}> ${RESET}")" ATTACH_BUILD
+        while true; do
+          read -rp "$(echo -e "${BOLD_BLUE}> ${RESET}")" ATTACH_BUILD
+          [[ "$ATTACH_BUILD" =~ ^[YyNn]$ ]] && break
+          echo -e "${RED}❌ Please enter y or n.${RESET}"
+        done
         if [[ "$ATTACH_BUILD" =~ ^[Yy]$ ]]; then
           screen -r nockbuild
         else
@@ -392,7 +401,11 @@ case "$USER_CHOICE" in
     clear
     echo -e "${YELLOW}You are about to update Nockchain to the latest version from GitHub.${RESET}"
     echo -e "${YELLOW}Continue? (y/n)${RESET}"
-    read -rp "$(echo -e "${BOLD_BLUE}> ${RESET}")" CONFIRM_UPDATE
+    while true; do
+      read -rp "$(echo -e "${BOLD_BLUE}> ${RESET}")" CONFIRM_UPDATE
+      [[ "$CONFIRM_UPDATE" =~ ^[YyNn]$ ]] && break
+      echo -e "${RED}❌ Please enter y or n.${RESET}"
+    done
     if [[ ! "$CONFIRM_UPDATE" =~ ^[Yy]$ ]]; then
       echo -e "${CYAN}Returning to menu...${RESET}"
       continue
@@ -407,8 +420,11 @@ case "$USER_CHOICE" in
     MINING_KEY_DISPLAY=$(grep "^MINING_PUBKEY=" "$HOME/nockchain/.env" | cut -d= -f2)
     echo -e "${CYAN}Public Key:${RESET} $MINING_KEY_DISPLAY"
     echo -e "${YELLOW}Do you want to automatically restart all miners after update using this key? (y/n)${RESET}"
-    read -rp "$(echo -e "${BOLD_BLUE}> ${RESET}")" CONFIRM_RESTART_AFTER_UPDATE
-
+    while true; do
+      read -rp "$(echo -e "${BOLD_BLUE}> ${RESET}")" CONFIRM_RESTART_AFTER_UPDATE
+      [[ "$CONFIRM_RESTART_AFTER_UPDATE" =~ ^[YyNn]$ ]] && break
+      echo -e "${RED}❌ Please enter y or n.${RESET}"
+    done
     if [[ "$CONFIRM_RESTART_AFTER_UPDATE" =~ ^[Yy]$ ]]; then
       echo -e "${CYAN}>> Launching update and miner restart in screen session 'nockupdate'...${RESET}"
       screen -dmS nockupdate bash -c "
@@ -444,7 +460,11 @@ case "$USER_CHOICE" in
     echo -e "${DIM}Press Ctrl+A then D${RESET}"
 
     echo -e "${YELLOW}Do you want to attach to the 'nockupdate' screen session now? (y/n)${RESET}"
-    read -rp "$(echo -e "${BOLD_BLUE}> ${RESET}")" ATTACH_CHOICE
+    while true; do
+      read -rp "$(echo -e "${BOLD_BLUE}> ${RESET}")" ATTACH_CHOICE
+      [[ "$ATTACH_CHOICE" =~ ^[YyNn]$ ]] && break
+      echo -e "${RED}❌ Please enter y or n.${RESET}"
+    done
     if [[ "$ATTACH_CHOICE" =~ ^[Yy]$ ]]; then
       screen -r nockupdate
     fi
@@ -457,7 +477,11 @@ case "$USER_CHOICE" in
     clear
     echo -e "${YELLOW}You are about to update only the Nockchain Wallet (nockchain-wallet).${RESET}"
     echo -e "${YELLOW}Continue? (y/n)${RESET}"
-    read -rp "$(echo -e "${BOLD_BLUE}> ${RESET}")" CONFIRM_UPDATE_WALLET
+    while true; do
+      read -rp "$(echo -e "${BOLD_BLUE}> ${RESET}")" CONFIRM_UPDATE_WALLET
+      [[ "$CONFIRM_UPDATE_WALLET" =~ ^[YyNn]$ ]] && break
+      echo -e "${RED}❌ Please enter y or n.${RESET}"
+    done
     if [[ ! "$CONFIRM_UPDATE_WALLET" =~ ^[Yy]$ ]]; then
       echo -e "${CYAN}Returning to menu...${RESET}"
       continue
@@ -482,7 +506,11 @@ case "$USER_CHOICE" in
     echo -e "${CYAN}To exit screen: ${DIM}Ctrl+A then D${RESET}"
 
     echo -e "${YELLOW}Do you want to attach to the 'walletupdate' screen session now? (y/n)${RESET}"
-    read -rp "$(echo -e "${BOLD_BLUE}> ${RESET}")" ATTACH_WALLET
+    while true; do
+      read -rp "$(echo -e "${BOLD_BLUE}> ${RESET}")" ATTACH_WALLET
+      [[ "$ATTACH_WALLET" =~ ^[YyNn]$ ]] && break
+      echo -e "${RED}❌ Please enter y or n.${RESET}"
+    done
     if [[ "$ATTACH_WALLET" =~ ^[Yy]$ ]]; then
       screen -r walletupdate
     fi
@@ -495,7 +523,11 @@ case "$USER_CHOICE" in
     clear
     echo -e "${YELLOW}You are about to update the launcher script to the latest version from GitHub.${RESET}"
     echo -e "${YELLOW}Continue? (y/n)${RESET}"
-    read -rp "$(echo -e "${BOLD_BLUE}> ${RESET}")" CONFIRM_LAUNCHER_UPDATE
+    while true; do
+      read -rp "$(echo -e "${BOLD_BLUE}> ${RESET}")" CONFIRM_LAUNCHER_UPDATE
+      [[ "$CONFIRM_LAUNCHER_UPDATE" =~ ^[YyNn]$ ]] && break
+      echo -e "${RED}❌ Please enter y or n.${RESET}"
+    done
     if [[ ! "$CONFIRM_LAUNCHER_UPDATE" =~ ^[Yy]$ ]]; then
       echo -e "${CYAN}Returning to menu...${RESET}"
       continue
@@ -529,21 +561,127 @@ case "$USER_CHOICE" in
     ;;
   5)
     clear
-    echo -e "${YELLOW}You are about to launch one or more miners.${RESET}"
-    echo -e "${YELLOW}Are you sure you want to proceed? (y/n)${RESET}"
-    read -rp "$(echo -e "${BOLD_BLUE}> ${RESET}")" CONFIRM_LAUNCH
+    echo -e "${YELLOW}You are about to configure and launch one or more miners.${RESET}"
+    echo -e "${YELLOW}Do you want to continue with miner setup? (y/n)${RESET}"
+    while true; do
+      read -rp "$(echo -e "${BOLD_BLUE}> ${RESET}")" CONFIRM_LAUNCH
+      [[ "$CONFIRM_LAUNCH" =~ ^[YyNn]$ ]] && break
+      echo -e "${RED}❌ Please enter y or n.${RESET}"
+    done
     if [[ ! "$CONFIRM_LAUNCH" =~ ^[Yy]$ ]]; then
       echo -e "${CYAN}Returning to menu...${RESET}"
       continue
     fi
     # Phase 2: Ensure Nockchain build exists before miner setup
     if [ -f "$BINARY_PATH" ]; then
-        echo -e "${GREEN}>> Build detected. Continuing Phase 2 (Wallet + Miner Setup)...${RESET}"
+        echo -e "${GREEN}✅ Build detected. Continuing to miner setup...${RESET}"
     else
         echo -e "${RED}!! ERROR: Build not completed or failed.${RESET}"
         echo -e "${YELLOW}>> Check build log: $LOG_PATH${RESET}"
         echo -e "${YELLOW}>> Resume screen: ${DIM}screen -r nockbuild${RESET}"
         continue
+    fi
+    # Always write start_miner.sh to ensure consistency
+    START_SCRIPT="$SCRIPT_DIR/start_miner.sh"
+    EXPECTED_LAUNCHER=$(cat <<'EOS'
+#!/bin/bash
+DIR="$1"
+MINER_NAME=$(basename "$DIR")
+
+CONFIG_FILE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/launch.cfg"
+get_config_value() {
+  local section="$1"
+  local key="$2"
+  local file="$3"
+  awk -F= -v section="[$section]" -v key="$key" '
+    $0 == section { in_section=1; next }
+    /^\[.*\]/     { in_section=0 }
+    in_section && $1 ~ key { gsub(/^[ \t]+|[ \t]+$/, "", $2); print $2; exit }
+  ' "$file"
+}
+
+MINING_KEY=$(get_config_value "$MINER_NAME" "MINING_KEY" "$CONFIG_FILE")
+BIND_FLAG=$(get_config_value "$MINER_NAME" "BIND_FLAG" "$CONFIG_FILE")
+PEER_FLAG=$(get_config_value "$MINER_NAME" "PEER_FLAG" "$CONFIG_FILE")
+MAX_ESTABLISHED_FLAG=$(get_config_value "$MINER_NAME" "MAX_ESTABLISHED_FLAG" "$CONFIG_FILE")
+STATE_FLAG=$(get_config_value "$MINER_NAME" "STATE_FLAG" "$CONFIG_FILE")
+
+LOG_FILE="$DIR/$MINER_NAME.log"
+
+CMD=(
+  "$HOME/nockchain/target/release/nockchain"
+  --mine
+  --mining-pubkey "$MINING_KEY"
+)
+[[ -n "$BIND_FLAG" ]] && CMD+=($BIND_FLAG)
+[[ -n "$PEER_FLAG" ]] && CMD+=($PEER_FLAG)
+[[ -n "$MAX_ESTABLISHED_FLAG" ]] && CMD+=($MAX_ESTABLISHED_FLAG)
+[[ -n "$STATE_FLAG" ]] && CMD+=($STATE_FLAG)
+
+FULL_CMD="cd \"$DIR\" && \
+RUST_LOG=info,nockchain=info,nockchain_libp2p_io=info,libp2p=info,libp2p_quic=info \
+MINIMAL_LOG_FORMAT=true ${CMD[*]} | tee \"$LOG_FILE\""
+echo "Launching miner: $FULL_CMD"
+tmux new-session -d -s "$MINER_NAME" "$FULL_CMD"
+EOS
+)
+    echo -e "${CYAN}>> Generating/updating start_miner.sh...${RESET}"
+    echo "$EXPECTED_LAUNCHER" > "$START_SCRIPT"
+    chmod +x "$START_SCRIPT"
+    echo -e "${GREEN}✅ start_miner.sh is ready.${RESET}"
+
+    # Prompt for use of existing config if present
+    if [[ -f "$CONFIG_FILE" ]]; then
+      echo ""
+      echo -e "${CYAN}📋 Existing Miner Configuration Detected (launch.cfg):${RESET}"
+      echo -e "${DIM}---------------------------------------${RESET}"
+      cat "$CONFIG_FILE"
+      echo -e "${DIM}---------------------------------------${RESET}"
+      echo -e "${YELLOW}Do you want to keep this existing configuration?${RESET}"
+      echo -e "${CYAN}1) Use existing launch.cfg${RESET}"
+      echo -e "${CYAN}2) Discard and create new configuration${RESET}"
+      while true; do
+        read -rp "$(echo -e "${BOLD_BLUE}> Enter choice [1/2]: ${RESET}")" USE_EXISTING_CFG
+        [[ "$USE_EXISTING_CFG" == "1" || "$USE_EXISTING_CFG" == "2" ]] && break
+        echo -e "${RED}❌ Invalid input. Please enter 1 or 2.${RESET}"
+      done
+      if [[ "$USE_EXISTING_CFG" == "1" ]]; then
+        # Automatically count number of miners in existing config
+        NUM_MINERS=$(grep -c '^\[miner[0-9]\+\]' "$CONFIG_FILE")
+        echo -e "${CYAN}✅ Using existing launch.cfg.${RESET}"
+        echo ""
+        echo -e "${YELLOW}>> Launching configured miners...${RESET}"
+        for i in $(seq 1 "$NUM_MINERS"); do
+          (
+            MINER_DIR="$NCK_DIR/miner$i"
+            mkdir -p "$MINER_DIR"
+            if tmux has-session -t miner$i 2>/dev/null; then
+              echo -e "${YELLOW}⚠️  Skipping miner$i: tmux session already exists.${RESET}"
+              exit
+            fi
+            echo -e "${CYAN}>> Starting miner$i in tmux...${RESET}"
+            start_miner_tmux "miner$i" "$MINER_DIR" "$MINING_KEY"
+          ) &
+        done
+        wait
+        echo ""
+        if tmux has-session -t "miner1" 2>/dev/null; then
+          echo -e "${GREEN}🎉 Nockchain miners launched successfully!${RESET}"
+        else
+          echo -e "${RED}❌ Failed to launch miners. No tmux sessions detected.${RESET}"
+        fi
+        echo ""
+        echo -e "${CYAN}Manage your miners with the following commands:${RESET}"
+        echo -e "${CYAN}- List sessions:   ${DIM}tmux ls${RESET}"
+        echo -e "${CYAN}- Attach session:  ${DIM}tmux attach -t minerX${RESET}"
+        echo -e "${CYAN}- Detach:          ${DIM}Ctrl + b then d${RESET}"
+        echo -e "${YELLOW}Press any key to return to the main menu...${RESET}"
+        read -n 1 -s
+        continue
+      else
+        echo -e "${YELLOW}⚠️ Discarding existing configuration...${RESET}"
+        rm -f "$CONFIG_FILE"
+      fi
     fi
     cd "$HOME/nockchain"
     export PATH="$PATH:$(pwd)/target/release"
@@ -556,7 +694,11 @@ case "$USER_CHOICE" in
     else
       echo -e "${YELLOW}No wallet (keys.export) found.${RESET}"
       echo -e "${YELLOW}Do you want to generate a new wallet now? (y/n)${RESET}"
-      read -rp "$(echo -e "${BOLD_BLUE}> ${RESET}")" CREATE_WALLET
+      while true; do
+        read -rp "$(echo -e "${BOLD_BLUE}> ${RESET}")" CREATE_WALLET
+        [[ "$CREATE_WALLET" =~ ^[YyNn]$ ]] && break
+        echo -e "${RED}❌ Please enter y or n.${RESET}"
+      done
       if [[ ! "$CREATE_WALLET" =~ ^[Yy]$ ]]; then
         echo -e "${CYAN}Returning to menu...${RESET}"
         continue
@@ -584,7 +726,11 @@ case "$USER_CHOICE" in
       echo -e "${YELLOW}The following mining public key will be used:${RESET}"
       echo -e "${CYAN}$MINING_KEY${RESET}"
       echo -e "${YELLOW}Is this correct? (y/n)${RESET}"
-      read -rp "$(echo -e "${BOLD_BLUE}> ${RESET}")" CONFIRM_KEY
+      while true; do
+        read -rp "$(echo -e "${BOLD_BLUE}> ${RESET}")" CONFIRM_KEY
+        [[ "$CONFIRM_KEY" =~ ^[YyNn]$ ]] && break
+        echo -e "${RED}❌ Please enter y or n.${RESET}"
+      done
       if [[ "$CONFIRM_KEY" =~ ^[Yy]$ ]]; then
         break
       fi
@@ -619,16 +765,227 @@ case "$USER_CHOICE" in
         echo -e "${CYAN}Returning to menu...${RESET}"
         break
       elif [[ "$NUM_MINERS" =~ ^[0-9]+$ && "$NUM_MINERS" -ge 1 ]]; then
+        # Prompt for max connections per miner
         echo ""
-        echo -e "${CYAN}You are about to launch the following miners:${RESET}"
-        miner_list=$(seq 1 "$NUM_MINERS" | sed 's/^/miner/')
-        echo -e "${GREEN}$miner_list${RESET}"
+        echo -e "${YELLOW}Do you want to set a maximum number of connections per miner?${RESET}"
+        echo -e "${DIM}Hint: 32 is often a safe value. Leave empty to skip this option.${RESET}"
+        read -rp "$(echo -e "${BOLD_BLUE}> Enter value (e.g., 32) or leave blank: ${RESET}")" MAX_ESTABLISHED
+        echo ""
+        # Prompt for peer mode
+        echo ""
+        echo -e "${YELLOW}Select peer mode for these miners:${RESET}"
+        echo -e "${CYAN}1) No peers (isolated)${RESET}"
+        echo -e "${CYAN}2) Central node (all miners peer with miner1 only)${RESET}"
+        echo -e "${CYAN}3) Full mesh (all miners peer with each other)${RESET}"
+        echo -e "${CYAN}4) Custom peers (manual entry per miner)${RESET}"
+        while true; do
+          read -rp "$(echo -e "${BOLD_BLUE}> Enter peer mode [1-4]: ${RESET}")" PEER_MODE
+          if [[ "$PEER_MODE" =~ ^[1-4]$ ]]; then
+            break
+          else
+            echo -e "${RED}❌ Invalid input. Enter 1, 2, 3, or 4.${RESET}"
+          fi
+        done
+        # Prompt for BASE_PORT if needed
+        if [[ "$PEER_MODE" == "2" || "$PEER_MODE" == "3" ]]; then
+          echo -e "${YELLOW}Enter a base UDP port for miner communication (default: 40000):${RESET}"
+          read -rp "$(echo -e "${BOLD_BLUE}> ${RESET}")" BASE_PORT_INPUT
+          BASE_PORT_INPUT=$(echo "$BASE_PORT_INPUT" | tr -d '[:space:]')
+          if [[ -z "$BASE_PORT_INPUT" ]]; then
+            BASE_PORT=40000
+          elif ! [[ "$BASE_PORT_INPUT" =~ ^[0-9]+$ ]] || (( BASE_PORT_INPUT < 1024 || BASE_PORT_INPUT > 65000 )); then
+            echo -e "${RED}❌ Invalid port. Using default 40000.${RESET}"
+            BASE_PORT=40000
+          else
+            BASE_PORT=$BASE_PORT_INPUT
+          fi
+        else
+          BASE_PORT=""
+        fi
+        declare -A CUSTOM_PEERS_MAP
+        if [[ "$PEER_MODE" == "4" ]]; then
+          for i in $(seq 1 "$NUM_MINERS"); do
+            MINER_NAME="miner$i"
+            declare -a UNIQUE_PEERS=()
+            while true; do
+              echo -e "${YELLOW}Enter custom peer string(s) for ${CYAN}$MINER_NAME${YELLOW}, space-separated. Press Enter to finish:${RESET}"
+              read -rp "> " CUSTOM_PEERS
+
+              valid=()
+              invalid=()
+
+              for peer in $CUSTOM_PEERS; do
+                if [[ "$peer" =~ ^--peer\ /ip4/[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/udp/[0-9]+/quic-v1$ ]]; then
+                  duplicate=0
+                  for up in "${UNIQUE_PEERS[@]}"; do
+                    [[ "$peer" == "$up" ]] && duplicate=1 && break
+                  done
+                  if [[ $duplicate -eq 0 ]]; then
+                    valid+=("$peer")
+                    UNIQUE_PEERS+=("$peer")
+                  fi
+                else
+                  invalid+=("$peer")
+                fi
+              done
+
+              echo ""
+              echo -e "${GREEN}✅ Accepted peers:${RESET}"
+              for p in "${UNIQUE_PEERS[@]}"; do
+                echo "  $p"
+              done
+
+              if [[ ${#invalid[@]} -gt 0 ]]; then
+                echo ""
+                echo -e "${RED}❌ Invalid format skipped:${RESET}"
+                for p in "${invalid[@]}"; do
+                  echo "  $p"
+                done
+              fi
+
+              echo ""
+              echo -e "${YELLOW}Press Enter to confirm this list, or type more peers:${RESET}"
+              read -rp "> " CONTINUE_INPUT
+              [[ -z "$CONTINUE_INPUT" ]] && break
+            done
+
+            if [[ ${#UNIQUE_PEERS[@]} -eq 0 ]]; then
+              CUSTOM_PEERS_MAP["$MINER_NAME"]=""
+            else
+              CUSTOM_PEERS_MAP["$MINER_NAME"]="${UNIQUE_PEERS[*]}"
+            fi
+          done
+        fi
+        # Create launch.cfg before preview so it can be shown to the user
+        LAUNCH_CFG="$SCRIPT_DIR/launch.cfg"
+        # Compute PEER_FLAGs for all miners
+        declare -A PEER_FLAG_MAP
+        if [[ "$PEER_MODE" == "1" ]]; then
+          for i in $(seq 1 "$NUM_MINERS"); do
+            PEER_FLAG_MAP["miner$i"]=""
+          done
+        elif [[ "$PEER_MODE" == "2" ]]; then
+          for i in $(seq 1 "$NUM_MINERS"); do
+            if [[ "$i" == "1" ]]; then
+              PEER_FLAG_MAP["miner$i"]=""
+            else
+              PEER_FLAG_MAP["miner$i"]="--peer /ip4/127.0.0.1/udp/$((BASE_PORT + 1))/quic-v1"
+            fi
+          done
+        elif [[ "$PEER_MODE" == "3" ]]; then
+          for i in $(seq 1 "$NUM_MINERS"); do
+            peers=()
+            for j in $(seq 1 "$NUM_MINERS"); do
+              [[ "$j" == "$i" ]] && continue
+              peers+=("--peer /ip4/127.0.0.1/udp/$((BASE_PORT + j))/quic-v1")
+            done
+            PEER_FLAG_MAP["miner$i"]="${peers[*]}"
+          done
+        elif [[ "$PEER_MODE" == "4" ]]; then
+          for i in $(seq 1 "$NUM_MINERS"); do
+            MINER_NAME="miner$i"
+            PEER_FLAG_MAP["$MINER_NAME"]="${CUSTOM_PEERS_MAP[$MINER_NAME]}"
+          done
+        fi
+        # Compute BIND_FLAGs for all miners, similar to PEER_FLAG_MAP logic
+        declare -A BIND_FLAG_MAP
+        if [[ "$PEER_MODE" == "2" || "$PEER_MODE" == "3" ]]; then
+          for i in $(seq 1 "$NUM_MINERS"); do
+            BIND_FLAG_MAP["miner$i"]="--bind /ip4/0.0.0.0/udp/$((BASE_PORT + i))/quic-v1"
+          done
+        fi
+        # Compute MAX_ESTABLISHED_FLAG for all miners
+        declare -A MAX_ESTABLISHED_FLAG_MAP
+        for i in $(seq 1 "$NUM_MINERS"); do
+          MINER_NAME="miner$i"
+          if [[ -n "$MAX_ESTABLISHED" ]]; then
+            MAX_ESTABLISHED_FLAG_MAP["$MINER_NAME"]="--max-established $MAX_ESTABLISHED"
+          else
+            MAX_ESTABLISHED_FLAG_MAP["$MINER_NAME"]=""
+          fi
+        done
+        {
+          # Write BASE_PORT if set
+          [[ -n "$BASE_PORT" ]] && echo "BASE_PORT=$BASE_PORT"
+          for i in $(seq 1 "$NUM_MINERS"); do
+            MINER_NAME="miner$i"
+            echo ""
+            echo "[$MINER_NAME]"
+            echo "MINING_KEY=$MINING_KEY"
+            echo "BIND_FLAG=${BIND_FLAG_MAP[$MINER_NAME]:-}"
+            echo "PEER_FLAG=${PEER_FLAG_MAP[$MINER_NAME]:-}"
+            echo "MAX_ESTABLISHED_FLAG=${MAX_ESTABLISHED_FLAG_MAP[$MINER_NAME]:-}"
+            echo "STATE_FLAG=--state-jam ../state.jam"
+          done
+        } > "$CONFIG_FILE"
+        echo ""
+        # Show the miners to be launched
+        # Updated: Grouped, clearer miner command preview
+        echo -e "${CYAN}📋 You are about to launch the following miners and their commands:${RESET}"
+        echo ""
+        if [[ -f "$LAUNCH_CFG" ]]; then
+          for i in $(seq 1 "$NUM_MINERS"); do
+            MINER_NAME="miner$i"
+            DIR="$HOME/nockchain/$MINER_NAME"
+            # Use the globally confirmed mining key since it's already known
+            MINING_KEY="$MINING_KEY"
+            BIND_FLAG=$(awk -v section="[$MINER_NAME]" '
+              $0 == section {found=1; next}
+              /^\[.*\]/ {found=0}
+              found && /^BIND_FLAG=/ {
+                sub(/^BIND_FLAG=/, "")
+                print
+                exit
+              }
+            ' "$LAUNCH_CFG")
+            PEER_FLAG=$(awk -v section="[$MINER_NAME]" '
+              $0 == section {found=1; next}
+              /^\[.*\]/ {found=0}
+              found && /^PEER_FLAG=/ {
+                sub(/^PEER_FLAG=/, "")
+                print
+                exit
+              }
+            ' "$LAUNCH_CFG")
+            MAX_ESTABLISHED_FLAG=$(awk -v section="[$MINER_NAME]" '
+              $0 == section {found=1; next}
+              /^\[.*\]/ {found=0}
+              found && /^MAX_ESTABLISHED_FLAG=/ {
+                sub(/^MAX_ESTABLISHED_FLAG=/, "")
+                print
+                exit
+              }
+            ' "$LAUNCH_CFG")
+            STATE_FLAG=$(awk -v section="[$MINER_NAME]" '
+              $0 == section {found=1; next}
+              /^\[.*\]/ {found=0}
+              found && /^STATE_FLAG=/ {
+                sub(/^STATE_FLAG=/, "")
+                print
+                exit
+              }
+            ' "$LAUNCH_CFG")
+            echo -e "${BOLD_BLUE}$MINER_NAME${RESET}"
+            echo -e "${DIM}> tmux new-session -d -s $MINER_NAME \"cd $DIR && RUST_LOG=info,nockchain=info,nockchain_libp2p_io=info,libp2p=info,libp2p_quic=info MINIMAL_LOG_FORMAT=true \$HOME/nockchain/target/release/nockchain --mine --mining-pubkey $MINING_KEY $BIND_FLAG $PEER_FLAG $MAX_ESTABLISHED_FLAG $STATE_FLAG | tee $DIR/$MINER_NAME.log\"${RESET}"
+            echo ""
+          done
+        else
+          echo -e "${RED}❌ Configuration file not found.${RESET}"
+        fi
         echo -e "${YELLOW}Proceed? (y/n)${RESET}"
-        read -rp "$(echo -e "${BOLD_BLUE}> ${RESET}")" CONFIRM_LAUNCH
+        while true; do
+          read -rp "$(echo -e "${BOLD_BLUE}> ${RESET}")" CONFIRM_LAUNCH
+          [[ "$CONFIRM_LAUNCH" =~ ^[YyNn]$ ]] && break
+          echo -e "${RED}❌ Please enter y or n.${RESET}"
+        done
         if [[ ! "$CONFIRM_LAUNCH" =~ ^[Yy]$ ]]; then
           echo -e "${CYAN}Returning to miner count selection...${RESET}"
           continue
         fi
+        echo -e "${GREEN}Created launch.cfg at $CONFIG_FILE${RESET}"
+        echo ""
+        echo -e "${YELLOW}All miner configuration is now managed by $SCRIPT_DIR/launch.cfg.${RESET}"
+        echo -e "${CYAN}To adjust peer mode, use_state, or custom peers, edit $SCRIPT_DIR/launch.cfg.${RESET}"
         for i in $(seq 1 "$NUM_MINERS"); do
           (
             MINER_DIR="$NCK_DIR/miner$i"
@@ -637,19 +994,17 @@ case "$USER_CHOICE" in
               echo -e "${YELLOW}⚠️  Skipping miner$i: tmux session already exists.${RESET}"
               exit
             fi
-            if [ -f "$NCK_DIR/state.jam" ]; then
-              USE_STATE_JAM="y"
-            else
-              USE_STATE_JAM="n"
-            fi
             echo -e "${CYAN}>> Starting miner$i in tmux...${RESET}"
-            start_miner_tmux "miner$i" "$MINER_DIR" "$MINING_KEY" "$USE_STATE_JAM"
-            echo -e "${GREEN}✅ Miner$i is running in tmux session 'miner$i'.${RESET}"
+            start_miner_tmux "miner$i" "$MINER_DIR" "$MINING_KEY"
           ) &
         done
         wait
         echo ""
-        echo -e "${GREEN}🎉 Nockchain miners launched successfully!${RESET}"
+        if tmux has-session -t "miner1" 2>/dev/null; then
+          echo -e "${GREEN}🎉 Nockchain miners launched successfully!${RESET}"
+        else
+          echo -e "${RED}❌ Failed to launch miners. No tmux sessions detected.${RESET}"
+        fi
         # Display post-launch instructions and tmux management tips
         echo ""
         echo -e "${CYAN}Manage your miners with the following commands:${RESET}"
@@ -702,7 +1057,11 @@ case "$USER_CHOICE" in
       echo -e "${CYAN}- $session${RESET}"
     done
     echo -e "${YELLOW}Are you sure you want to restart these? (y/n)${RESET}"
-    read -rp "$(echo -e "${BOLD_BLUE}> ${RESET}")" CONFIRM_RESTART
+    while true; do
+      read -rp "$(echo -e "${BOLD_BLUE}> ${RESET}")" CONFIRM_RESTART
+      [[ "$CONFIRM_RESTART" =~ ^[YyNn]$ ]] && break
+      echo -e "${RED}❌ Please enter y or n.${RESET}"
+    done
     [[ ! "$CONFIRM_RESTART" =~ ^[Yy]$ ]] && echo -e "${CYAN}Returning to menu...${RESET}" && continue
     for session in $TARGET_SESSIONS; do
       echo -e "${CYAN}Restarting $session...${RESET}"
@@ -710,7 +1069,7 @@ case "$USER_CHOICE" in
       miner_num=$(echo "$session" | grep -o '[0-9]\+')
       miner_dir="$HOME/nockchain/miner$miner_num"
       mkdir -p "$miner_dir"
-      start_miner_tmux "$session" "$miner_dir" "$MINING_KEY" "n"
+      start_miner_tmux "$session" "$miner_dir" "$MINING_KEY"
     done
     echo -e "${GREEN}✅ Selected miners have been restarted.${RESET}"
     echo -e "${CYAN}To attach to a tmux session: ${DIM}tmux attach -t minerX${RESET}"
@@ -761,7 +1120,11 @@ case "$USER_CHOICE" in
       echo -e "${CYAN}- $session${RESET}"
     done
     echo -e "${YELLOW}Are you sure you want to stop these? (y/n)${RESET}"
-    read -rp "$(echo -e "${BOLD_BLUE}> ${RESET}")" CONFIRM_STOP
+    while true; do
+      read -rp "$(echo -e "${BOLD_BLUE}> ${RESET}")" CONFIRM_STOP
+      [[ "$CONFIRM_STOP" =~ ^[YyNn]$ ]] && break
+      echo -e "${RED}❌ Please enter y or n.${RESET}"
+    done
     [[ ! "$CONFIRM_STOP" =~ ^[Yy]$ ]] && echo -e "${CYAN}Returning to menu...${RESET}" && continue
     for session in $TARGET_SESSIONS; do
       echo -e "${CYAN}Stopping $session...${RESET}"
