@@ -217,7 +217,7 @@ printf "${BOLD_BLUE}%-40s%-40s${RESET}\n" \
   "2) Update nockchain to latest version" "22) Monitor resource usage (htop)" \
   "3) Update nockchain-wallet only"       "" \
   "4) Update launcher script"             "" \
-  "5) Export state.jam from a miner"      ""
+  "5) Export or download state.jam file"      ""
 
 # Full-width layout for Miner Operations
 echo -e ""
@@ -246,8 +246,6 @@ fi
 case "$USER_CHOICE" in
   5)
     clear
-    echo -e "${CYAN}Export state.jam from a miner${RESET}"
-    echo ""
 
     miner_dirs=$(find "$HOME/nockchain" -maxdepth 1 -type d -name "miner*" | sort -V)
 
@@ -266,6 +264,19 @@ case "$USER_CHOICE" in
     # Build formatted fzf menu showing miner name and latest block height, with status icon
     declare -a menu_entries=()
     declare -A miner_dirs_map
+
+    # Fetch latest commit message that modified state.jam
+    GITHUB_COMMIT_MSG=$(curl -fsSL "https://api.github.com/repos/jobless0x/nockchain-launcher/commits?path=state.jam" \
+      | grep -m 1 '"message":' \
+      | grep -oE 'block [0-9]+\.[0-9]+' \
+      | head -n 1)
+
+    if [[ "$GITHUB_COMMIT_MSG" =~ block[[:space:]]+([0-9]+\.[0-9]+) ]]; then
+      BLOCK_COMMIT_VERSION="${BASH_REMATCH[1]}"
+    else
+      BLOCK_COMMIT_VERSION="unknown"
+    fi
+    GITHUB_COMMIT_DISPLAY="📦 Download latest state.jam from GitHub (block $BLOCK_COMMIT_VERSION)"
 
     for dir in $miner_dirs; do
       miner_id=$(basename "$dir" | grep -o '[0-9]\+')
@@ -286,11 +297,67 @@ case "$USER_CHOICE" in
       miner_dirs_map["$miner_name"]="$dir"
     done
 
-    menu_entries=("↩️  Cancel and return to menu" "${menu_entries[@]}")
+    menu_entries=("↩️  Cancel and return to menu" "$GITHUB_COMMIT_DISPLAY" "${menu_entries[@]}")
 
     selected=$(printf "%s\n" "${menu_entries[@]}" | fzf --ansi --prompt="Select miner to export from: " \
       --pointer="👉" --color=prompt:blue,fg+:cyan,bg+:238,pointer:green,marker:green \
       --header=$'\nUse ↑ ↓ arrows to navigate. ENTER to confirm.\n')
+
+    if [[ "$selected" == *"Download latest state.jam from GitHub"* ]]; then
+      echo -e "${CYAN}📥 Step 1/3: Create temp folder, Initializing Git and GIT LFS...${RESET}"
+      TMP_CLONE="$HOME/nockchain/tmp_launcher_clone"
+      rm -rf "$TMP_CLONE"
+
+      # Ensure git and git-lfs are installed (auto-install if missing)
+      for tool in git git-lfs; do
+        if ! command -v $tool &>/dev/null; then
+          echo -e "${YELLOW}⚠️ '$tool' not found. Installing...${RESET}"
+          sudo apt-get update && sudo apt-get install -y "$tool"
+        fi
+      done
+
+      echo ""
+      echo -e "${CYAN}📥 Step 2/4: Cloning launcher repo into temp folder...${RESET}"
+      if GIT_LFS_SKIP_SMUDGE=1 git clone --progress https://github.com/jobless0x/nockchain-launcher.git "$TMP_CLONE"; then
+        echo -e "${GREEN}✅ Repo cloned successfully.${RESET}"
+        
+        echo ""
+        echo -e "${CYAN}⏳ Step 3/4: Downloading state.jam [block $BLOCK_COMMIT_VERSION], this may take a while...${RESET}"
+      else
+        echo -e "${RED}❌ Failed to clone repo. Exiting.${RESET}"
+        read -n 1 -s
+        continue
+      fi
+
+      cd "$TMP_CLONE"
+      trap 'echo -e "${RED}✖️  Interrupted. Cleaning up...${RESET}"; rm -rf "$TMP_CLONE"; exit 130' INT
+      git lfs install --skip-repo &>/dev/null
+      if command -v pv &>/dev/null; then
+        echo -e "${CYAN}🔄 Downloading state.jam via Git LFS...${RESET}"
+        git lfs pull --include="state.jam" 2>&1 | grep --line-buffered -v 'Downloading LFS objects:' | pv -lep -s 1100000000 -N "state.jam" > /dev/null
+        echo -e "${GREEN}✅ Download complete.${RESET}"
+      else
+        echo -e "${CYAN}🔄 Downloading state.jam...${RESET}"
+        git lfs pull --include="state.jam"
+        echo -e "${GREEN}✅ Download complete.${RESET}"
+      fi
+      trap - INT
+
+      if [[ ! -f "state.jam" ]]; then
+        echo -e "${RED}❌ state.jam not found after LFS pull. Exiting.${RESET}"
+        read -n 1 -s
+        continue
+      fi
+
+      echo ""
+      echo -e "${CYAN}📦 Step 4/4: Moving state.jam to ~/nockchain and cleaning up...${RESET}"
+      mv "state.jam" "$HOME/nockchain/state.jam"
+      rm -rf "$TMP_CLONE"
+
+      echo -e "${GREEN}✅ state.jam downloaded and saved to ${CYAN}$HOME/nockchain/state.jam${GREEN}.${RESET}"
+      read -n 1 -s -r -p $'\nPress any key to return to the main menu...'
+      continue
+    fi
 
     selected_miner=$(echo "$selected" | grep -Eo 'miner[0-9]+' | head -n 1 || true)
 
