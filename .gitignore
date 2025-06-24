@@ -5,7 +5,6 @@
 
 # Miner state and runtime data
 miner*/
-state.jam
 *.log
 
 # Logs and exports
