@@ -1,5 +1,4 @@
 #!/bin/bash
-set -e
 
 GREEN="\e[32m"
 RED="\e[31m"
@@ -9,56 +8,72 @@ BOLD_BLUE="\e[1;34m"
 DIM="\e[2m"
 RESET="\e[0m"
 
-for dep in tmux screen; do
-  if ! command -v "$dep" &>/dev/null; then
-    echo -e "${RED}Error: Required dependency '$dep' is not installed.${RESET}"
-    exit 1
-  fi
-done
+set -euo pipefail
+trap 'exit_code=$?; [[ $exit_code -eq 130 ]] && exit 130; [[ $exit_code -ne 0 ]] && echo -e "${RED}(FATAL ERROR) Script exited unexpectedly with code $exit_code on line $LINENO.${RESET}"; caller 0' ERR
 
-if [[ -n "$TMUX" ]]; then
-  echo -e "${RED}⚠️  Please exit tmux before running this script.${RESET}"
-  exit 1
-fi
 
-start_miner_tmux() {
-  local session=$1
-  local dir=$2
-  local key=$3
 
-  if tmux has-session -t "$session" 2>/dev/null; then
-    echo -e "${YELLOW}⚠️  Skipping $session: tmux session already exists.${RESET}"
+# Systemd service generator for miners
+generate_systemd_service() {
+  local miner_id=$1
+  local miner_dir="$HOME/nockchain/miner$miner_id"
+  local service_name="nockchain-miner$miner_id"
+  local service_file="/etc/systemd/system/${service_name}.service"
+  # Extract MINER_KEY for this miner from config before writing the unit file
+  MINER_KEY=$(awk -v section="[miner$miner_id]" '
+    $0 == section {found=1; next}
+    /^\[.*\]/ {found=0}
+    found && /^MINING_KEY=/ {
+      sub(/^MINING_KEY=/, "")
+      print
+      exit
+    }
+  ' "$CONFIG_FILE")
+  local abs_dir="$HOME/nockchain/miner$miner_id"
+  local abs_script="$(realpath "$SCRIPT_DIR/run_miner.sh")"
+  local actual_user
+  actual_user=$(whoami)
+  sudo bash -c "cat > '$service_file'" <<EOF
+[Unit]
+Description=nockchain-miner$miner_id
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Restart=always
+RestartSec=5
+StartLimitIntervalSec=0
+Type=simple
+WorkingDirectory=$abs_dir
+User=root
+Environment="MINING_KEY=$MINER_KEY"
+ExecStart=/bin/bash $abs_script $miner_id
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  sudo systemctl daemon-reload
+}
+
+start_miner_service() {
+  local miner_id=$1
+  echo -e ""
+  echo -e "${CYAN}🔧 Launching miner$miner_id via systemd...${RESET}"
+
+  if systemctl is-active --quiet nockchain-miner$miner_id; then
+    echo -e "${CYAN}🔄 miner$miner_id is already running. Skipping start.${RESET}"
     return
   fi
 
-  cd "$dir"
-  bash "$SCRIPT_DIR/start_miner.sh" "$dir" "$key"
-
-  sleep 0.5
-
-  if tmux has-session -t "$session" 2>/dev/null; then
-    echo -e "${GREEN}✅ $session is running in tmux session '$session'.${RESET}"
+  sudo systemctl start nockchain-miner$miner_id
+  if systemctl is-active --quiet nockchain-miner$miner_id; then
+    echo -e "${GREEN}  ✅ miner$miner_id is now running.${RESET}"
   else
-    echo -e "${RED}❌ Failed to launch $session. Tmux session not found.${RESET}"
+    echo -e "${RED}  ❌ Failed to launch miner$miner_id.${RESET}"
   fi
-}
-
-# Calculate uptime of a running tmux miner session (formatted as h/m)
-get_miner_uptime() {
-  local session=$1
-  if tmux has-session -t "$session" 2>/dev/null; then
-    local start_ts=$(tmux display -p -t "$session" '#{start_time}' 2>/dev/null)
-    local now_ts=$(date +%s)
-    local diff=$((now_ts - start_ts))
-    local hours=$((diff / 3600))
-    local minutes=$(((diff % 3600) / 60))
-    if (( hours > 0 )); then
-      echo "${hours}h ${minutes}m"
-    else
-      echo "${minutes}m"
-    fi
-  else
-    echo "not running"
+  if ! systemctl is-active --quiet nockchain-miner$miner_id; then
+    echo -e "${RED}    ❌ miner$miner_id failed to start. Check logs:${RESET}"
+    echo -e "${CYAN}      journalctl -u nockchain-miner$miner_id -e${RESET}"
   fi
 }
 
@@ -75,20 +90,28 @@ else
   LAUNCHER_VERSION="(unknown)"
 fi
 # Fetch remote version directly, do not overwrite local version file except during update
-REMOTE_VERSION=$(curl -fsSL https://raw.githubusercontent.com/jobless0x/nockchain-launcher/main/NOCKCHAIN_LAUNCHER_VERSION | tr -d '[:space:]')
+REMOTE_VERSION=$(curl -fsSL https://raw.githubusercontent.com/jobless0x/nockchain-launcher/main/NOCKCHAIN_LAUNCHER_VERSION 2>/dev/null | tr -d '[:space:]')
+REMOTE_VERSION=${REMOTE_VERSION:-"(offline)"}
 
+#
 # Begin main launcher loop that displays the menu and handles user input
+# Check for interactive terminal (TTY) before entering the loop
+if [[ ! -t 0 ]]; then
+  echo -e "${RED}❌ ERROR: Script must be run in an interactive terminal (TTY). Exiting.${RESET}"
+  exit 1
+fi
 while true; do
 clear
 
 echo -e "${RED}"
 cat <<'EOF'
-                  _        _           _       
- _ __   ___   ___| | _____| |__   __ _(_)_ __  
-| '_ \ / _ \ / __| |/ / __| '_ \ / _` | | '_ \ 
-| | | | (_) | (__|   < (__| | | | (_| | | | | |
-|_| |_|\___/ \___|_|\_\___|_| |_|\__,_|_|_| |_|
+    _   _            _        _           _
+   | \ | | ___   ___| | _____| |__   __ _(_)_ __
+   |  \| |/ _ \ / __| |/ / __| '_ \ / _` | | '_ \
+   | |\  | (_) | (__|   < (__| | | | (_| | | | | |
+   |_| \_|\___/ \___|_|\_\___|_| |_|\__,_|_|_| |_|
 EOF
+echo -e "${RESET}"
 
 echo -e "${YELLOW}:: Powered by Jobless ::${RESET}"
 
@@ -101,9 +124,11 @@ all_blocks=()
 for miner_dir in "$HOME/nockchain"/miner*; do
   [[ -d "$miner_dir" ]] || continue
   log_file="$miner_dir/$(basename "$miner_dir").log"
-  if [[ -f "$log_file" ]]; then
-    height=$(grep -a 'heard block' "$log_file" | tail -n 5 | grep -oP 'height\s+\K[0-9]+\.[0-9]+' | sort -V | tail -n 1)
-    [[ -n "$height" ]] && all_blocks+=("$height")
+  if [[ -f "$log_file" && -r "$log_file" ]]; then
+    heard_block=$(grep -a 'heard block' "$log_file" | tail -n 5 | grep -oP 'height\s+\K[0-9]+\.[0-9]+' || true)
+    validated_block=$(grep -a 'added to validated blocks at' "$log_file" | tail -n 5 | grep -oP 'at\s+\K[0-9]+\.[0-9]+' || true)
+    combined=$(printf "%s\n%s\n" "$heard_block" "$validated_block" | sort -V | tail -n 1)
+    [[ -n "$combined" ]] && all_blocks+=("$combined")
   fi
 done
 if [[ ${#all_blocks[@]} -gt 0 ]]; then
@@ -113,8 +138,12 @@ fi
 echo -e "${DIM}Install, configure, and monitor multiple Nockchain miners with ease.${RESET}"
 echo ""
 
-RUNNING_MINERS=$(tmux ls 2>/dev/null | grep -c '^miner' || true)
-RUNNING_MINERS=${RUNNING_MINERS:-0}
+RUNNING_MINERS=0
+for i in $(find "$HOME/nockchain" -maxdepth 1 -type d -name "miner*" 2>/dev/null | sed 's/.*miner//;s/[^0-9]//g' | sort -n); do
+  if systemctl is-active --quiet nockchain-miner$i 2>/dev/null; then
+    ((RUNNING_MINERS=RUNNING_MINERS+1))
+  fi
+done
 MINER_FOLDERS=$(find "$HOME/nockchain" -maxdepth 1 -type d -name "miner*" 2>/dev/null | wc -l)
 if (( RUNNING_MINERS > 0 )); then
   echo -e "${GREEN}🟢 $RUNNING_MINERS active miners${RESET} ${DIM}($MINER_FOLDERS total miners)${RESET}"
@@ -178,33 +207,31 @@ printf "  ${CYAN}%-12s${RESET}%-20s\n" "CPU Load:" "$CPU_LOAD / $(nproc)"
 printf "  ${CYAN}%-12s${RESET}%-20s\n" "RAM Used:" "$RAM_USED / $RAM_TOTAL"
 printf "  ${CYAN}%-12s${RESET}%-20s\n" "Uptime:" "$(uptime -p)"
 
-echo -e "${RED}
-NOCKCHAIN NODE MANAGER
----------------------------------------${RESET}"
+echo -e "\e[31m::════════════════════════════════════════════════════════\e[0m"
+echo ""
 
-echo -e "${CYAN}Setup:${RESET}"
-echo -e "${BOLD_BLUE}1) Install Nockchain from scratch${RESET}"
-echo -e "${BOLD_BLUE}2) Update nockchain to latest version${RESET}"
-echo -e "${BOLD_BLUE}3) Update nockchain-wallet only${RESET}"
-echo -e "${BOLD_BLUE}4) Update launcher script${RESET}"
+# Two-column layout for Setup and System Utilities
+printf "${CYAN}%-40s%-40s${RESET}\n" "Setup:" "System Utilities:"
+printf "${BOLD_BLUE}%-40s%-40s${RESET}\n" \
+  "1) Install Nockchain from scratch"     "21) Run system diagnostics" \
+  "2) Update nockchain to latest version" "22) Monitor resource usage (htop)" \
+  "3) Update nockchain-wallet only"       "" \
+  "4) Update launcher script"             "" \
+  "5) Export state.jam from a miner"      ""
 
+# Full-width layout for Miner Operations
 echo -e ""
 echo -e "${CYAN}Miner Operations:${RESET}"
-echo -e "${BOLD_BLUE}5) Launch miner(s)${RESET}"
-echo -e "${BOLD_BLUE}6) Restart miner(s)${RESET}"
-echo -e "${BOLD_BLUE}7) Stop miner(s)${RESET}"
-
-echo -e ""
-echo -e "${CYAN}System Utilities:${RESET}"
-echo -e "${BOLD_BLUE}0) Run system diagnostics${RESET}"
-echo -e "${BOLD_BLUE}8) Show running miner(s)${RESET}"
-echo -e "${BOLD_BLUE}9) Monitor resource usage (htop)${RESET}"
+echo -e "${BOLD_BLUE}11) Monitor miner status (live view)${RESET}"
+echo -e "${BOLD_BLUE}12) Stream miner logs (tail -f)${RESET}"
+echo -e "${BOLD_BLUE}13) Launch miner(s)${RESET}"
+echo -e "${BOLD_BLUE}14) Restart miner(s)${RESET}"
+echo -e "${BOLD_BLUE}15) Stop miner(s)${RESET}"
 
 echo -e ""
 echo -ne "${BOLD_BLUE}Select an option from the menu above (or press Enter to exit): ${RESET}"
- # Display tips for controlling tmux and screen sessions
 echo -e ""
-echo -e "${DIM}Tip: Use ${BOLD_BLUE}tmux ls${DIM} to see running miners, ${BOLD_BLUE}tmux attach -t miner1${DIM} to enter a session, ${BOLD_BLUE}Ctrl+b then d${DIM} to detach tmux, ${BOLD_BLUE}screen -r nockbuild${DIM} to monitor build sessions, and ${BOLD_BLUE}Ctrl+a then d${DIM} to detach screen.${RESET}"
+echo -e "${DIM}Tip: Use ${BOLD_BLUE}systemctl status nockchain-minerX${DIM} to check miner status, and ${BOLD_BLUE}tail -f ~/nockchain/minerX/minerX.log{DIM} to view logs. Use ${BOLD_BLUE}sudo systemctl stop nockchain-minerX${DIM} to stop a miner.${RESET}"
 read USER_CHOICE
 
 # Define important paths for binaries and logs
@@ -217,7 +244,85 @@ if [[ -z "$USER_CHOICE" ]]; then
 fi
 
 case "$USER_CHOICE" in
-  0)
+  5)
+    clear
+    echo -e "${CYAN}Export state.jam from a miner${RESET}"
+    echo ""
+
+    miner_dirs=$(find "$HOME/nockchain" -maxdepth 1 -type d -name "miner*" | sort -V)
+
+    if [[ -z "$miner_dirs" ]]; then
+      echo -e "${RED}❌ No miner directories found.${RESET}"
+      read -n 1 -s -r -p $'\nPress any key to return to menu...'
+      continue
+    fi
+
+    if ! command -v fzf &> /dev/null; then
+      echo -e "${YELLOW}fzf not found. Installing fzf...${RESET}"
+      sudo apt-get update && sudo apt-get install -y fzf
+      echo -e "${GREEN}fzf installed successfully.${RESET}"
+    fi
+
+    # Build formatted fzf menu showing miner name and latest block height, with status icon
+    declare -a menu_entries=()
+    declare -A miner_dirs_map
+
+    for dir in $miner_dirs; do
+      miner_id=$(basename "$dir" | grep -o '[0-9]\+')
+      log_path="$dir/miner${miner_id}.log"
+      miner_name="miner${miner_id}"
+      latest_block="--"
+      if [[ -f "$log_path" ]]; then
+        latest_block=$(grep -a 'added to validated blocks at' "$log_path" 2>/dev/null | tail -n 1 | grep -oP 'at\s+\K[0-9]+\.[0-9]+' || echo "--")
+      fi
+      # Determine systemd status for this miner
+      if systemctl is-active --quiet "nockchain-${miner_name}"; then
+        status_icon="🟢"
+      else
+        status_icon="🔴"
+      fi
+      label="$(printf "%s %b%-8s%b %b[Block: %s]%b" "$status_icon" "${BOLD_BLUE}" "$miner_name" "${RESET}" "${DIM}" "$latest_block" "${RESET}")"
+      menu_entries+=("$label")
+      miner_dirs_map["$miner_name"]="$dir"
+    done
+
+    menu_entries=("↩️  Cancel and return to menu" "${menu_entries[@]}")
+
+    selected=$(printf "%s\n" "${menu_entries[@]}" | fzf --ansi --prompt="Select miner to export from: " \
+      --pointer="👉" --color=prompt:blue,fg+:cyan,bg+:238,pointer:green,marker:green \
+      --header=$'\nUse ↑ ↓ arrows to navigate. ENTER to confirm.\n')
+
+    selected_miner=$(echo "$selected" | grep -Eo 'miner[0-9]+' | head -n 1 || true)
+
+    if [[ -z "$selected_miner" || -z "${miner_dirs_map[$selected_miner]:-}" ]]; then
+      echo -e "${YELLOW}No valid selection made. Returning to menu...${RESET}"
+      continue
+    fi
+
+    select_dir="${miner_dirs_map[$selected_miner]}"
+    miner_name=$(basename "$select_dir")
+    export_dir="$HOME/nockchain/miner-export"
+    state_output="$HOME/nockchain/state.jam"
+
+    echo -e "${CYAN}Creating temporary copy of $miner_name for safe export...${RESET}"
+    rm -rf "$export_dir"
+    cp -a "$select_dir" "$export_dir"
+
+    echo -e "${CYAN}Exporting state.jam to $state_output...${RESET}"
+    echo -e "${DIM}Log will be saved to ~/nockchain/export.log${RESET}"
+    cd "$export_dir"
+    echo -e "${CYAN}Running export process...${RESET}"
+    "$HOME/nockchain/target/release/nockchain" --export-state-jam "$state_output" 2>&1 | tee "$HOME/nockchain/export.log"
+    cd "$HOME/nockchain"
+    rm -rf "$export_dir"
+
+    echo -e "${GREEN}✅ Exported state.jam from duplicate of ${CYAN}$selected_miner${GREEN} to ${CYAN}$state_output${GREEN}.${RESET}"
+    echo -e "${DIM}To view detailed export logs: tail -n 20 ~/nockchain/export.log${RESET}"
+    echo -e "${YELLOW}Press any key to return to the main menu...${RESET}"
+    read -n 1 -s
+    continue
+    ;;
+  21)
     clear
     echo -e "${CYAN}System Diagnostics${RESET}"
     echo ""
@@ -559,7 +664,7 @@ case "$USER_CHOICE" in
     read -n 1 -s
     exec "$SCRIPT_PATH"
     ;;
-  5)
+  13)
     clear
     echo -e "${YELLOW}You are about to configure and launch one or more miners.${RESET}"
     echo -e "${YELLOW}Do you want to continue with miner setup? (y/n)${RESET}"
@@ -581,65 +686,90 @@ case "$USER_CHOICE" in
         echo -e "${YELLOW}>> Resume screen: ${DIM}screen -r nockbuild${RESET}"
         continue
     fi
-    # Always write start_miner.sh to ensure consistency
-    START_SCRIPT="$SCRIPT_DIR/start_miner.sh"
-    EXPECTED_LAUNCHER=$(cat <<'EOS'
+    # Write run_miner.sh for systemd
+    RUN_MINER_SCRIPT="$SCRIPT_DIR/run_miner.sh"
+cat > "$RUN_MINER_SCRIPT" <<'EOS'
 #!/bin/bash
-DIR="$1"
-MINER_NAME=$(basename "$DIR")
+set -eux
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-CONFIG_FILE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/launch.cfg"
-get_config_value() {
-  local section="$1"
-  local key="$2"
-  local file="$3"
-  awk -F= -v section="[$section]" -v key="$key" '
-    $0 == section { in_section=1; next }
-    /^\[.*\]/     { in_section=0 }
-    in_section && $1 ~ key { gsub(/^[ \t]+|[ \t]+$/, "", $2); print $2; exit }
-  ' "$file"
-}
+id=${1:-0}
+if [[ -z "$id" || "$id" -lt 1 || "$id" -gt 999 ]]; then
+  echo "Invalid miner ID: $id"
+  exit 1
+fi
 
-MINING_KEY=$(get_config_value "$MINER_NAME" "MINING_KEY" "$CONFIG_FILE")
-BIND_FLAG=$(get_config_value "$MINER_NAME" "BIND_FLAG" "$CONFIG_FILE")
-PEER_FLAG=$(get_config_value "$MINER_NAME" "PEER_FLAG" "$CONFIG_FILE")
-MAX_ESTABLISHED_FLAG=$(get_config_value "$MINER_NAME" "MAX_ESTABLISHED_FLAG" "$CONFIG_FILE")
-STATE_FLAG=$(get_config_value "$MINER_NAME" "STATE_FLAG" "$CONFIG_FILE")
+DIR="$HOME/nockchain/miner$id"
+mkdir -p "$DIR"
+cd "$DIR"
+rm -f .socket/nockchain_npc.sock || true
+STATE_FLAG=$(awk -v section="[miner$id]" '
+  $0 == section {found=1; next}
+  /^\[.*\]/ {found=0}
+  found && /^STATE_FLAG=/ {
+    sub(/^STATE_FLAG=/, "")
+    print
+    exit
+  }
+' "$SCRIPT_DIR/launch.cfg")
 
-LOG_FILE="$DIR/$MINER_NAME.log"
+# --- BEGIN PATCHED BLOCK ---
+BIND_FLAG=$(awk -v section="[miner$id]" '
+  $0 == section {found=1; next}
+  /^\[.*\]/ {found=0}
+  found && /^BIND_FLAG=/ {
+    sub(/^BIND_FLAG=/, "")
+    print
+    exit
+  }
+' "$SCRIPT_DIR/launch.cfg")
 
-CMD=(
-  "$HOME/nockchain/target/release/nockchain"
-  --mine
-  --mining-pubkey "$MINING_KEY"
-)
-[[ -n "$BIND_FLAG" ]] && CMD+=($BIND_FLAG)
-[[ -n "$PEER_FLAG" ]] && CMD+=($PEER_FLAG)
-[[ -n "$MAX_ESTABLISHED_FLAG" ]] && CMD+=($MAX_ESTABLISHED_FLAG)
+MAX_ESTABLISHED=$(awk -v section="[miner$id]" '
+  $0 == section {found=1; next}
+  /^\[.*\]/ {found=0}
+  found && /^MAX_ESTABLISHED_FLAG=/ {
+    sub(/^MAX_ESTABLISHED_FLAG=/, "")
+    print
+    exit
+  }
+' "$SCRIPT_DIR/launch.cfg")
+# --- END PATCHED BLOCK ---
+
+export MINIMAL_LOG_FORMAT=true
+export RUST_LOG=info,nockchain=info,nockchain_libp2p_io=info,libp2p=info,libp2p_quic=info
+
+LOGFILE="miner${id}.log"
+if [ -e "$LOGFILE" ]; then
+  DT=$(date +"%Y%m%d_%H%M%S")
+  mv "$LOGFILE" miner${id}-$DT.log
+fi
+
+## --- BEGIN PATCHED BLOCK: Updated conditional command construction ---
+CMD=("$HOME/nockchain/target/release/nockchain" --mine --mining-pubkey "$MINING_KEY")
+if [[ -n "$BIND_FLAG" && "$BIND_FLAG" != "--bind" ]]; then
+  CMD+=($BIND_FLAG)
+fi
+[[ -n "$MAX_ESTABLISHED" ]] && CMD+=($MAX_ESTABLISHED)
 [[ -n "$STATE_FLAG" ]] && CMD+=($STATE_FLAG)
-
-FULL_CMD="cd \"$DIR\" && \
-RUST_LOG=info,nockchain=info,nockchain_libp2p_io=info,libp2p=info,libp2p_quic=info \
-MINIMAL_LOG_FORMAT=true ${CMD[*]} | tee \"$LOG_FILE\""
-echo "Launching miner: $FULL_CMD"
-tmux new-session -d -s "$MINER_NAME" "$FULL_CMD"
+"${CMD[@]}" 2>&1 | tee "$LOGFILE"
+## --- END PATCHED BLOCK ---
 EOS
-)
-    echo -e "${CYAN}>> Generating/updating start_miner.sh...${RESET}"
-    echo "$EXPECTED_LAUNCHER" > "$START_SCRIPT"
-    chmod +x "$START_SCRIPT"
-    echo -e "${GREEN}✅ start_miner.sh is ready.${RESET}"
+    chmod +x "$RUN_MINER_SCRIPT"
+    echo -e "${GREEN}✅ run_miner.sh is ready.${RESET}"
 
     # Prompt for use of existing config if present
     if [[ -f "$CONFIG_FILE" ]]; then
       echo ""
-      echo -e "${CYAN}📋 Existing Miner Configuration Detected (launch.cfg):${RESET}"
-      echo -e "${DIM}---------------------------------------${RESET}"
+      echo -e "${BOLD_BLUE}${CYAN}⚙️  Miner Configuration${RESET}"
+      echo -e "${DIM}──────────────────────────────────────────────${RESET}"
       cat "$CONFIG_FILE"
-      echo -e "${DIM}---------------------------------------${RESET}"
+      echo -e "${DIM}──────────────────────────────────────────────${RESET}"
+      echo ""
       echo -e "${YELLOW}Do you want to keep this existing configuration?${RESET}"
-      echo -e "${CYAN}1) Use existing launch.cfg${RESET}"
-      echo -e "${CYAN}2) Discard and create new configuration${RESET}"
+      echo ""
+      echo -e "${CYAN}1) Use existing configuration${RESET}"
+      echo -e "${CYAN}2) Create new configuration${RESET}"
+      echo ""
       while true; do
         read -rp "$(echo -e "${BOLD_BLUE}> Enter choice [1/2]: ${RESET}")" USE_EXISTING_CFG
         [[ "$USE_EXISTING_CFG" == "1" || "$USE_EXISTING_CFG" == "2" ]] && break
@@ -648,39 +778,56 @@ EOS
       if [[ "$USE_EXISTING_CFG" == "1" ]]; then
         # Automatically count number of miners in existing config
         NUM_MINERS=$(grep -c '^\[miner[0-9]\+\]' "$CONFIG_FILE")
-        echo -e "${CYAN}✅ Using existing launch.cfg.${RESET}"
         echo ""
-        echo -e "${YELLOW}>> Launching configured miners...${RESET}"
+        echo -e "${GREEN}✅ Using existing configuration.${RESET}"
+        echo ""
+        echo -e "${BOLD_BLUE}${CYAN}🔧 Launch Preview${RESET}"
+        printf "  ${CYAN}%-10s %-22s %-22s${RESET}\n" "Miner" "Systemd Service" "Run Command"
         for i in $(seq 1 "$NUM_MINERS"); do
-          (
+          MINER_DIR="$NCK_DIR/miner$i"
+          SERVICE="nockchain-miner$i.service"
+          RUN_CMD="cd $MINER_DIR && exec run_miner.sh $i"
+          printf "  ${BOLD_BLUE}%-10s${RESET} %-22s %-22s\n" "miner$i" "$SERVICE" "$RUN_CMD"
+        done
+        echo ""
+        echo -e "${YELLOW}Proceed? (y/n)${RESET}"
+        echo ""
+        while true; do
+          read -rp "$(echo -e "${BOLD_BLUE}> ${RESET}")" CONFIRM_EXISTING_LAUNCH
+          [[ "$CONFIRM_EXISTING_LAUNCH" =~ ^[YyNn]$ ]] && break
+          echo -e "${RED}❌ Please enter y or n.${RESET}"
+        done
+        if [[ "$CONFIRM_EXISTING_LAUNCH" =~ ^[Yy]$ ]]; then
+          echo ""
+          echo -e "${GREEN}Proceeding with miner launch...${RESET}"
+          for i in $(seq 1 "$NUM_MINERS"); do
             MINER_DIR="$NCK_DIR/miner$i"
             mkdir -p "$MINER_DIR"
-            if tmux has-session -t miner$i 2>/dev/null; then
-              echo -e "${YELLOW}⚠️  Skipping miner$i: tmux session already exists.${RESET}"
-              exit
-            fi
-            echo -e "${CYAN}>> Starting miner$i in tmux...${RESET}"
-            start_miner_tmux "miner$i" "$MINER_DIR" "$MINING_KEY"
-          ) &
-        done
-        wait
-        echo ""
-        if tmux has-session -t "miner1" 2>/dev/null; then
-          echo -e "${GREEN}🎉 Nockchain miners launched successfully!${RESET}"
+            generate_systemd_service $i
+            start_miner_service $i
+          done
+          echo ""
+          echo -e "${GREEN}\e[1m🎉 Success:${RESET}${GREEN} Nockchain miners launched via systemd!${RESET}"
+          echo ""
+          echo -e "${CYAN}  Manage your miners with the following commands:${RESET}"
+          echo -e "${CYAN}    - Status:   ${DIM}systemctl status nockchain-minerX${RESET}"
+          echo -e "${CYAN}    - Logs:     ${DIM}tail -f ~/nockchain/minerX/minerX.log${RESET}"
+          echo -e "${CYAN}    - Stop:     ${DIM}sudo systemctl stop nockchain-minerX${RESET}"
+          echo -e "${CYAN}    - Start:    ${DIM}sudo systemctl start nockchain-minerX${RESET}"
+          echo ""
+          echo -e "${YELLOW}Press any key to return to the main menu...${RESET}"
+          read -n 1 -s
+          continue
         else
-          echo -e "${RED}❌ Failed to launch miners. No tmux sessions detected.${RESET}"
+          echo ""
+          echo -e "${CYAN}Returning to menu...${RESET}"
+          continue
         fi
-        echo ""
-        echo -e "${CYAN}Manage your miners with the following commands:${RESET}"
-        echo -e "${CYAN}- List sessions:   ${DIM}tmux ls${RESET}"
-        echo -e "${CYAN}- Attach session:  ${DIM}tmux attach -t minerX${RESET}"
-        echo -e "${CYAN}- Detach:          ${DIM}Ctrl + b then d${RESET}"
-        echo -e "${YELLOW}Press any key to return to the main menu...${RESET}"
-        read -n 1 -s
-        continue
       else
+        echo ""
         echo -e "${YELLOW}⚠️ Discarding existing configuration...${RESET}"
         rm -f "$CONFIG_FILE"
+        echo ""
       fi
     fi
     cd "$HOME/nockchain"
@@ -739,7 +886,8 @@ EOS
       sed -i "s/^MINING_PUBKEY=.*/MINING_PUBKEY=$MINING_KEY/" .env
     done
     # Configure and enable required UFW firewall rules for Nockchain
-    echo -e "${CYAN}>> Configuring firewall...${RESET}"
+    echo ""
+    echo -e "${CYAN}\e[1m▶ Configuring firewall...${RESET}"
     sudo ufw allow ssh >/dev/null 2>&1 || true
     sudo ufw allow 22 >/dev/null 2>&1 || true
     sudo ufw allow 3005/tcp >/dev/null 2>&1 || true
@@ -748,36 +896,37 @@ EOS
     sudo ufw allow 3006/udp >/dev/null 2>&1 || true
     sudo ufw --force enable >/dev/null 2>&1 || echo -e "${YELLOW}Warning: Failed to enable UFW. Continuing script execution.${RESET}"
     echo -e "${GREEN}✅ Firewall configured.${RESET}"
+    echo ""
     # Collect system specs and calculate optimal number of miners
     CPU_CORES=$(nproc)
     TOTAL_MEM=$(free -g | awk '/^Mem:/ {print $2}')
     echo ""
-    echo -e "${CYAN}📈 Miner Recommendation:${RESET}"
-    echo -e "${CYAN}Recommended: 1 miner per 2 vCPUs and 8GB RAM${RESET}"
-    RECOMMENDED_MINERS=$(( CPU_CORES / 2 < TOTAL_MEM / 8 ? CPU_CORES / 2 : TOTAL_MEM / 8 ))
-    echo -e "${YELLOW}For this system, max recommended miners: ${RESET}${CYAN}$RECOMMENDED_MINERS${RESET}"
-    echo ""
     while true; do
-      echo -e "${YELLOW}How many miners do you want to run? (Enter a number like 1, 3, 10...) or 'n' to cancel:${RESET}"
+      echo -e "${YELLOW}How many miners do you want to run?${RESET}"
+      echo -e "${DIM}Enter a number like 1, 3, 10... or type 'n' to cancel.${RESET}"
+      echo ""
       read -rp "$(echo -e "${BOLD_BLUE}> ${RESET}")" NUM_MINERS
       NUM_MINERS=$(echo "$NUM_MINERS" | tr -d '[:space:]')
       if [[ "$NUM_MINERS" =~ ^[Nn]$ ]]; then
+        echo ""
         echo -e "${CYAN}Returning to menu...${RESET}"
         break
       elif [[ "$NUM_MINERS" =~ ^[0-9]+$ && "$NUM_MINERS" -ge 1 ]]; then
         # Prompt for max connections per miner
         echo ""
         echo -e "${YELLOW}Do you want to set a maximum number of connections per miner?${RESET}"
-        echo -e "${DIM}Hint: 32 is often a safe value. Leave empty to skip this option.${RESET}"
-        read -rp "$(echo -e "${BOLD_BLUE}> Enter value (e.g., 32) or leave blank: ${RESET}")" MAX_ESTABLISHED
+        echo -e "${DIM}32 is often a safe value. Leave empty to skip this option.${RESET}"
+        echo ""
+        read -rp "$(echo -e "${BOLD_BLUE}> Enter value or press enter: ${RESET}")" MAX_ESTABLISHED
         echo ""
         # Prompt for peer mode
-        echo ""
         echo -e "${YELLOW}Select peer mode for these miners:${RESET}"
-        echo -e "${CYAN}1) No peers (isolated)${RESET}"
+        echo ""
+        echo -e "${CYAN}1) No peers (not recommended)${RESET}"
         echo -e "${CYAN}2) Central node (all miners peer with miner1 only)${RESET}"
         echo -e "${CYAN}3) Full mesh (all miners peer with each other)${RESET}"
         echo -e "${CYAN}4) Custom peers (manual entry per miner)${RESET}"
+        echo ""
         while true; do
           read -rp "$(echo -e "${BOLD_BLUE}> Enter peer mode [1-4]: ${RESET}")" PEER_MODE
           if [[ "$PEER_MODE" =~ ^[1-4]$ ]]; then
@@ -788,7 +937,7 @@ EOS
         done
         # Prompt for BASE_PORT if needed
         if [[ "$PEER_MODE" == "2" || "$PEER_MODE" == "3" ]]; then
-          echo -e "${YELLOW}Enter a base UDP port for miner communication (default: 40000):${RESET}"
+          echo -e "${YELLOW}Enter a base UDP port for miner communication (recommended: 40000):${RESET}"
           read -rp "$(echo -e "${BOLD_BLUE}> ${RESET}")" BASE_PORT_INPUT
           BASE_PORT_INPUT=$(echo "$BASE_PORT_INPUT" | tr -d '[:space:]')
           if [[ -z "$BASE_PORT_INPUT" ]]; then
@@ -920,120 +1069,77 @@ EOS
         } > "$CONFIG_FILE"
         echo ""
         # Show the miners to be launched
-        # Updated: Grouped, clearer miner command preview
-        echo -e "${CYAN}📋 You are about to launch the following miners and their commands:${RESET}"
-        echo ""
+        echo -e ""
+        echo -e "${BOLD_BLUE}${CYAN}⚙️  Miner Configuration${RESET}"
+        echo -e "${DIM}──────────────────────────────────────────────${RESET}"
         if [[ -f "$LAUNCH_CFG" ]]; then
-          for i in $(seq 1 "$NUM_MINERS"); do
-            MINER_NAME="miner$i"
-            DIR="$HOME/nockchain/$MINER_NAME"
-            # Use the globally confirmed mining key since it's already known
-            MINING_KEY="$MINING_KEY"
-            BIND_FLAG=$(awk -v section="[$MINER_NAME]" '
-              $0 == section {found=1; next}
-              /^\[.*\]/ {found=0}
-              found && /^BIND_FLAG=/ {
-                sub(/^BIND_FLAG=/, "")
-                print
-                exit
-              }
-            ' "$LAUNCH_CFG")
-            PEER_FLAG=$(awk -v section="[$MINER_NAME]" '
-              $0 == section {found=1; next}
-              /^\[.*\]/ {found=0}
-              found && /^PEER_FLAG=/ {
-                sub(/^PEER_FLAG=/, "")
-                print
-                exit
-              }
-            ' "$LAUNCH_CFG")
-            MAX_ESTABLISHED_FLAG=$(awk -v section="[$MINER_NAME]" '
-              $0 == section {found=1; next}
-              /^\[.*\]/ {found=0}
-              found && /^MAX_ESTABLISHED_FLAG=/ {
-                sub(/^MAX_ESTABLISHED_FLAG=/, "")
-                print
-                exit
-              }
-            ' "$LAUNCH_CFG")
-            STATE_FLAG=$(awk -v section="[$MINER_NAME]" '
-              $0 == section {found=1; next}
-              /^\[.*\]/ {found=0}
-              found && /^STATE_FLAG=/ {
-                sub(/^STATE_FLAG=/, "")
-                print
-                exit
-              }
-            ' "$LAUNCH_CFG")
-            echo -e "${BOLD_BLUE}$MINER_NAME${RESET}"
-            echo -e "${DIM}> tmux new-session -d -s $MINER_NAME \"cd $DIR && RUST_LOG=info,nockchain=info,nockchain_libp2p_io=info,libp2p=info,libp2p_quic=info MINIMAL_LOG_FORMAT=true \$HOME/nockchain/target/release/nockchain --mine --mining-pubkey $MINING_KEY $BIND_FLAG $PEER_FLAG $MAX_ESTABLISHED_FLAG $STATE_FLAG | tee $DIR/$MINER_NAME.log\"${RESET}"
-            echo ""
-          done
+          cat "$LAUNCH_CFG"
         else
           echo -e "${RED}❌ Configuration file not found.${RESET}"
         fi
-        echo -e "${YELLOW}Proceed? (y/n)${RESET}"
+        echo -e "${DIM}──────────────────────────────────────────────${RESET}"
+        echo ""
+        echo -e "${BOLD_BLUE}${CYAN}🔧 Launch Preview${RESET}"
+        printf "  ${CYAN}%-10s %-22s %-22s${RESET}\n" "Miner" "Systemd Service" "Run Command"
+        for i in $(seq 1 "$NUM_MINERS"); do
+          MINER_NAME="miner$i"
+          DIR="$HOME/nockchain/$MINER_NAME"
+          SERVICE="nockchain-miner$i.service"
+          RUN_CMD="cd $DIR && exec run_miner.sh $i"
+          printf "  ${BOLD_BLUE}%-10s${RESET} %-22s %-22s\n" "$MINER_NAME" "$SERVICE" "$RUN_CMD"
+        done
+        echo ""
+        echo -e "${YELLOW}Start nockchain miner(s)? (y/n)${RESET}"
         while true; do
           read -rp "$(echo -e "${BOLD_BLUE}> ${RESET}")" CONFIRM_LAUNCH
           [[ "$CONFIRM_LAUNCH" =~ ^[YyNn]$ ]] && break
           echo -e "${RED}❌ Please enter y or n.${RESET}"
         done
-        if [[ ! "$CONFIRM_LAUNCH" =~ ^[Yy]$ ]]; then
+        if [[ "$CONFIRM_LAUNCH" =~ ^[Yy]$ ]]; then
+          echo -e "${GREEN}Proceeding with miner launch...${RESET}"
+          echo ""
+          echo -e "${GREEN}📁 Configuration saved to: $CONFIG_FILE${RESET}"
+          echo -e "${CYAN}🧠 Managed by: launch.cfg (edit this file to change peer mode, state file, or flags)${RESET}"
+          for i in $(seq 1 "$NUM_MINERS"); do
+            MINER_DIR="$NCK_DIR/miner$i"
+            mkdir -p "$MINER_DIR"
+            generate_systemd_service $i
+            start_miner_service $i
+          done
+          echo ""
+          echo -e "${GREEN}\e[1m🎉 Success:${RESET}${GREEN} Nockchain miners launched via systemd!${RESET}"
+          echo ""
+          echo -e "${CYAN}  Manage your miners with the following commands:${RESET}"
+          echo -e "${CYAN}    - Status:   ${DIM}systemctl status nockchain-minerX${RESET}"
+          echo -e "${CYAN}    - Logs:     ${DIM}tail -f ~/nockchain/minerX/minerX.log${RESET}"
+          echo -e "${CYAN}    - Stop:     ${DIM}sudo systemctl stop nockchain-minerX${RESET}"
+          echo -e "${CYAN}    - Start:    ${DIM}sudo systemctl start nockchain-minerX${RESET}"
+          echo ""
+          echo -e "${YELLOW}Press any key to return to the main menu...${RESET}"
+          read -n 1 -s
+          break
+        else
           echo -e "${CYAN}Returning to miner count selection...${RESET}"
           continue
         fi
-        echo -e "${GREEN}Created launch.cfg at $CONFIG_FILE${RESET}"
-        echo ""
-        echo -e "${YELLOW}All miner configuration is now managed by $SCRIPT_DIR/launch.cfg.${RESET}"
-        echo -e "${CYAN}To adjust peer mode, use_state, or custom peers, edit $SCRIPT_DIR/launch.cfg.${RESET}"
-        for i in $(seq 1 "$NUM_MINERS"); do
-          (
-            MINER_DIR="$NCK_DIR/miner$i"
-            mkdir -p "$MINER_DIR"
-            if tmux has-session -t miner$i 2>/dev/null; then
-              echo -e "${YELLOW}⚠️  Skipping miner$i: tmux session already exists.${RESET}"
-              exit
-            fi
-            echo -e "${CYAN}>> Starting miner$i in tmux...${RESET}"
-            start_miner_tmux "miner$i" "$MINER_DIR" "$MINING_KEY"
-          ) &
-        done
-        wait
-        echo ""
-        if tmux has-session -t "miner1" 2>/dev/null; then
-          echo -e "${GREEN}🎉 Nockchain miners launched successfully!${RESET}"
-        else
-          echo -e "${RED}❌ Failed to launch miners. No tmux sessions detected.${RESET}"
-        fi
-        # Display post-launch instructions and tmux management tips
-        echo ""
-        echo -e "${CYAN}Manage your miners with the following commands:${RESET}"
-        echo -e "${CYAN}- List sessions:   ${DIM}tmux ls${RESET}"
-        echo -e "${CYAN}- Attach session:  ${DIM}tmux attach -t minerX${RESET}"
-        echo -e "${CYAN}- Detach:          ${DIM}Ctrl + b then d${RESET}"
-        echo ""
-        echo -e "${YELLOW}Press any key to return to the main menu...${RESET}"
-        read -n 1 -s
-        break
       else
         echo -e "${RED}❌ Invalid input. Please enter a positive number (e.g. 1, 3) or 'n' to cancel.${RESET}"
       fi
     done
     continue
     ;;
-  6)
+  14)
     clear
     all_miners=()
     for d in "$HOME/nockchain"/miner*; do
       [ -d "$d" ] || continue
-      session=$(basename "$d")
-      if tmux has-session -t "$session" 2>/dev/null; then
-        all_miners+=("🟢 $session")
+      miner_num=$(basename "$d" | sed 's/[^0-9]//g')
+      if systemctl is-active --quiet nockchain-miner$miner_num 2>/dev/null; then
+        all_miners+=("🟢 miner$miner_num")
       else
-        all_miners+=("❌ $session")
+        all_miners+=("❌ miner$miner_num")
       fi
     done
-    # Sort numerically by miner number, keep icons
     IFS=$'\n' sorted_miners=($(printf "%s\n" "${all_miners[@]}" | sort -k2 -V))
     unset IFS
     if ! command -v fzf &> /dev/null; then
@@ -1041,20 +1147,33 @@ EOS
       sudo apt-get update && sudo apt-get install -y fzf
       echo -e "${GREEN}fzf installed successfully.${RESET}"
     fi
-    menu=$(printf "%s\n" "↩️  Cancel and return to menu" "🔁 Restart all miners" "${sorted_miners[@]}")
-    selected=$(echo "$menu" | fzf --multi --bind "space:toggle" --prompt="Select miners to restart: " --header=$'\n\nUse SPACE to select miners.\nENTER will restart (or start) selected miners.\n\n')
+    # Build styled menu_entries for restart
+    declare -a menu_entries=()
+    menu_entries+=("🔁 Restart all miners")
+    menu_entries+=("↩️  Cancel and return to menu")
+    for entry in "${sorted_miners[@]}"; do
+      status_icon=$(echo "$entry" | awk '{print $1}')
+      miner_label=$(echo "$entry" | awk '{print $2}')
+      styled_entry="$(printf "%s %b%-8s%b" "$status_icon" "${BOLD_BLUE}" "$miner_label" "${RESET}")"
+      menu_entries+=("$styled_entry")
+    done
+    selected=$(printf "%s\n" "${menu_entries[@]}" | fzf --ansi --multi --bind "space:toggle" \
+      --prompt="Select miners to restart: " --pointer="👉" --marker="✓" \
+      --color=prompt:blue,fg+:cyan,bg+:238,pointer:green,marker:green \
+      --header=$'\nUse SPACE to select miners.\nENTER will restart selected miners.\n')
     if [[ -z "$selected" || "$selected" == *"Cancel and return to menu"* ]]; then
       echo -e "${YELLOW}No selection made. Returning to menu...${RESET}"
       continue
     fi
     if echo "$selected" | grep -q "Restart all miners"; then
-      TARGET_SESSIONS=$(printf "%s\n" "${sorted_miners[@]}" | sed 's/^[^ ]* //')
+      TARGET_MINERS=$(printf "%s\n" "${sorted_miners[@]}" | sed 's/^[^ ]* //')
     else
-      TARGET_SESSIONS=$(echo "$selected" | grep -v "Restart all miners" | grep -v "Cancel and return to menu" | sed 's/^[^ ]* //')
+      # Extract miner names from styled selection
+      TARGET_MINERS=$(echo "$selected" | grep -Eo 'miner[0-9]+')
     fi
     echo -e "${YELLOW}You selected:${RESET}"
-    for session in $TARGET_SESSIONS; do
-      echo -e "${CYAN}- $session${RESET}"
+    for miner in $TARGET_MINERS; do
+      echo -e "${CYAN}- $miner${RESET}"
     done
     echo -e "${YELLOW}Are you sure you want to restart these? (y/n)${RESET}"
     while true; do
@@ -1063,34 +1182,29 @@ EOS
       echo -e "${RED}❌ Please enter y or n.${RESET}"
     done
     [[ ! "$CONFIRM_RESTART" =~ ^[Yy]$ ]] && echo -e "${CYAN}Returning to menu...${RESET}" && continue
-    for session in $TARGET_SESSIONS; do
-      echo -e "${CYAN}Restarting $session...${RESET}"
-      tmux kill-session -t "$session" 2>/dev/null || true
-      miner_num=$(echo "$session" | grep -o '[0-9]\+')
-      miner_dir="$HOME/nockchain/miner$miner_num"
-      mkdir -p "$miner_dir"
-      start_miner_tmux "$session" "$miner_dir" "$MINING_KEY"
+    for miner in $TARGET_MINERS; do
+      miner_num=$(echo "$miner" | grep -o '[0-9]\+')
+      echo -e "${CYAN}Restarting $miner...${RESET}"
+      sudo systemctl restart nockchain-miner$miner_num
+      start_miner_service $miner_num
     done
-    echo -e "${GREEN}✅ Selected miners have been restarted.${RESET}"
-    echo -e "${CYAN}To attach to a tmux session: ${DIM}tmux attach -t minerX${RESET}"
-    echo -e "${CYAN}To detach from tmux: ${DIM}Ctrl + b then d${RESET}"
-    echo -e "${CYAN}To list tmux sessions: ${DIM}tmux ls${RESET}"
-    echo -e "${GREEN}✅ Current running miners:${RESET}"
-    tmux ls | grep '^miner' | cut -d: -f1 | sort -V
+    echo -e "${GREEN}✅ Selected miners have been restarted via systemd.${RESET}"
+    echo -e "${CYAN}To check status: ${DIM}systemctl status nockchain-minerX${RESET}"
+    echo -e "${CYAN}To view logs:    ${DIM}tail -f ~/nockchain/minerX/minerX.log${RESET}"
     echo -e "${YELLOW}Press any key to return to the main menu...${RESET}"
     read -n 1 -s
     continue
     ;;
-  7)
+  15)
     clear
     all_miners=()
     for d in "$HOME/nockchain"/miner*; do
       [ -d "$d" ] || continue
-      session=$(basename "$d")
-      if tmux has-session -t "$session" 2>/dev/null; then
-        all_miners+=("🟢 $session")
+      miner_num=$(basename "$d" | sed 's/[^0-9]//g')
+      if systemctl is-active --quiet nockchain-miner$miner_num 2>/dev/null; then
+        all_miners+=("🟢 miner$miner_num")
       else
-        all_miners+=("❌ $session")
+        all_miners+=("❌ miner$miner_num")
       fi
     done
     IFS=$'\n' sorted_miners=($(printf "%s\n" "${all_miners[@]}" | sort -k2 -V))
@@ -1104,20 +1218,32 @@ EOS
     for entry in "${sorted_miners[@]}"; do
       [[ "$entry" =~ ^🟢 ]] && running_miners+=("$entry")
     done
-    menu=$(printf "%s\n" "↩️  Cancel and return to menu" "🛑 Stop all running miners" "${running_miners[@]}")
-    selected=$(echo "$menu" | fzf --multi --bind "space:toggle" --prompt="Select miners to stop: " --header=$'\n\nUse SPACE to select miners.\nENTER will stop selected miners.\n\n')
+    # Build styled menu_entries for stop
+    declare -a menu_entries=()
+    menu_entries+=("🛑 Stop all running miners")
+    menu_entries+=("↩️  Cancel and return to menu")
+    for entry in "${running_miners[@]}"; do
+      status_icon=$(echo "$entry" | awk '{print $1}')
+      miner_label=$(echo "$entry" | awk '{print $2}')
+      styled_entry="$(printf "%s %b%-8s%b" "$status_icon" "${BOLD_BLUE}" "$miner_label" "${RESET}")"
+      menu_entries+=("$styled_entry")
+    done
+    selected=$(printf "%s\n" "${menu_entries[@]}" | fzf --ansi --multi --bind "space:toggle" \
+      --prompt="Select miners to stop: " --pointer="👉" --marker="✓" \
+      --color=prompt:blue,fg+:cyan,bg+:238,pointer:green,marker:green \
+      --header=$'\nUse SPACE to select miners.\nENTER will stop selected miners.\n')
     if [[ -z "$selected" || "$selected" == *"Cancel and return to menu"* ]]; then
       echo -e "${YELLOW}No selection made. Returning to menu...${RESET}"
       continue
     fi
     if echo "$selected" | grep -q "Stop all"; then
-      TARGET_SESSIONS=$(printf "%s\n" "${sorted_miners[@]}" | grep '^🟢' | sed 's/^[^ ]* //')
+      TARGET_MINERS=$(printf "%s\n" "${sorted_miners[@]}" | grep '^🟢' | sed 's/^[^ ]* //')
     else
-      TARGET_SESSIONS=$(echo "$selected" | grep '^🟢' | sed 's/^[^ ]* //')
+      TARGET_MINERS=$(echo "$selected" | grep -Eo 'miner[0-9]+')
     fi
     echo -e "${YELLOW}You selected:${RESET}"
-    for session in $TARGET_SESSIONS; do
-      echo -e "${CYAN}- $session${RESET}"
+    for miner in $TARGET_MINERS; do
+      echo -e "${CYAN}- $miner${RESET}"
     done
     echo -e "${YELLOW}Are you sure you want to stop these? (y/n)${RESET}"
     while true; do
@@ -1126,17 +1252,21 @@ EOS
       echo -e "${RED}❌ Please enter y or n.${RESET}"
     done
     [[ ! "$CONFIRM_STOP" =~ ^[Yy]$ ]] && echo -e "${CYAN}Returning to menu...${RESET}" && continue
-    for session in $TARGET_SESSIONS; do
-      echo -e "${CYAN}Stopping $session...${RESET}"
-      tmux kill-session -t "$session"
+    for miner in $TARGET_MINERS; do
+      miner_num=$(echo "$miner" | grep -o '[0-9]\+')
+      echo -e "${CYAN}Stopping $miner...${RESET}"
+      sudo systemctl stop nockchain-miner$miner_num
     done
-    echo -e "${GREEN}✅ Selected miners have been stopped.${RESET}"
+    echo -e "${GREEN}✅ Selected miners have been stopped via systemd.${RESET}"
     echo -e "${YELLOW}Press any key to return to the main menu...${RESET}"
     read -n 1 -s
     continue
     ;;
-  8)
+  11)
     clear
+    # Calculate total system memory in GB for MEM % -> GB conversion (outside the loop, only once)
+    TOTAL_MEM_KB=$(grep MemTotal /proc/meminfo | awk '{print $2}')
+    TOTAL_MEM_GB=$(awk "BEGIN { printf \"%.1f\", $TOTAL_MEM_KB/1024/1024 }")
     while true; do
       # Extract network height from all miner logs (live, every refresh)
       NETWORK_HEIGHT="--"
@@ -1144,9 +1274,14 @@ EOS
       for miner_dir in "$HOME/nockchain"/miner*; do
         [[ -d "$miner_dir" ]] || continue
         log_file="$miner_dir/$(basename "$miner_dir").log"
-        if [[ -f "$log_file" ]]; then
-          height=$(grep -a 'heard block' "$log_file" | tail -n 5 | grep -oP 'height\s+\K[0-9]+\.[0-9]+' | sort -V | tail -n 1)
-          [[ -n "$height" ]] && all_blocks+=("$height")
+        height=""
+        if [[ -f "$log_file" && -r "$log_file" ]]; then
+          heard_block=$(grep -a 'heard block' "$log_file" | tail -n 5 | grep -oP 'height\s+\K[0-9]+\.[0-9]+' || true)
+          validated_block=$(grep -a 'added to validated blocks at' "$log_file" | tail -n 5 | grep -oP 'at\s+\K[0-9]+\.[0-9]+' || true)
+          combined=$(printf "%s\n%s\n" "$heard_block" "$validated_block" | sort -V | tail -n 1)
+          if [[ -n "$combined" ]]; then
+            all_blocks+=("$combined")
+          fi
         fi
       done
       if [[ ${#all_blocks[@]} -gt 0 ]]; then
@@ -1155,11 +1290,11 @@ EOS
       tput cup 0 0
       echo -e "${DIM}🖥️  Live Miner Monitor ${RESET}"
       echo ""
-      echo -e "${DIM}Legend:${RESET} ${YELLOW}🟡 <5m${RESET} | ${CYAN}🔵 <30m${RESET} | ${GREEN}🟢 Stable >30m${RESET} | ${DIM}${RED}❌ Inactive${RESET}"
+      echo -e "${DIM}Legend:${RESET} ${YELLOW}🟡 <5m${RESET} | ${CYAN}🔵 <30m${RESET} | ${GREEN}🟢 Stable >30m${RESET} | ${RED}❌ Inactive${RESET}"
       echo ""
       echo -e "${CYAN}📡 Network height: ${RESET}$NETWORK_HEIGHT"
       echo ""
-      printf "   | %-9s | %-9s | %-9s | %-9s | %-9s | %-5s | %-10s | %-5s\n" "Miner" "Uptime" "CPU (%)" "MEM (%)" "Block" "Lag" "Status" "Peers"
+      printf "   | %-9s | %-9s | %-9s | %-9s | %-9s | %-9s | %-5s | %-10s | %-9s\n" "Miner" "Uptime" "CPU (%)" "MEM (%)" "RAM (GB)" "Block" "Lag" "Status" "Peers"
 
       all_miners=()
       for miner_dir in "$HOME/nockchain"/miner*; do
@@ -1177,14 +1312,14 @@ EOS
 
       for session in "${sorted_miners[@]}"; do
         miner_dir="$HOME/nockchain/$session"
-        log_file="$miner_dir/$session.log"
+        log_file="$miner_dir/${session}.log"
 
-        if tmux has-session -t "$session" 2>/dev/null; then
-          pane_pid=$(tmux list-panes -t "$session" -F "#{pane_pid}" 2>/dev/null)
-          miner_pid=$(pgrep -P "$pane_pid" -f nockchain | head -n 1)
+        if systemctl is-active --quiet nockchain-$session 2>/dev/null; then
+          # Get the actual nockchain process PID for this miner using systemd
+          miner_pid=$(systemctl show -p MainPID --value nockchain-$session)
 
           readable="--"
-          if [[ -n "$miner_pid" && -r "/proc/$miner_pid/stat" ]]; then
+          if [[ -n "$miner_pid" && "$miner_pid" =~ ^[0-9]+$ && "$miner_pid" -gt 1 && -r "/proc/$miner_pid/stat" ]]; then
             proc_start_ticks=$(awk '{print $22}' /proc/$miner_pid/stat)
             clk_tck=$(getconf CLK_TCK)
             boot_time=$(awk '/btime/ {print $2}' /proc/stat)
@@ -1212,13 +1347,35 @@ EOS
             color="${YELLOW}🟡"
           fi
 
-          if [[ -n "$miner_pid" ]]; then
-            cpu_mem=$(ps -p "$miner_pid" -o %cpu,%mem --no-headers)
-            cpu=$(echo "$cpu_mem" | awk '{print $1}')
-            mem=$(echo "$cpu_mem" | awk '{print $2}')
+          # Validate miner_pid before using for metrics
+          if [[ -z "$miner_pid" || ! "$miner_pid" =~ ^[0-9]+$ || "$miner_pid" -le 1 || ! -e "/proc/$miner_pid" ]]; then
+            cpu="--"
+            mem="--"
           else
-            cpu="?"
-            mem="?"
+            child_pid=""
+            for cpid in $(pgrep -P "$miner_pid"); do
+              cmdline=$(ps -p "$cpid" -o cmd=)
+              if [[ "$cmdline" == *nockchain/target/release/nockchain* ]]; then
+                child_pid="$cpid"
+                break
+              fi
+            done
+            if [[ -n "$child_pid" && -e "/proc/$child_pid" ]]; then
+              cpu_mem=$(ps -p "$child_pid" -o %cpu,%mem --no-headers)
+              cpu=$(echo "$cpu_mem" | awk '{print $1}')
+              mem=$(echo "$cpu_mem" | awk '{print $2}')
+            else
+              cpu="--"
+              mem="--"
+            fi
+          fi
+
+          # Read memory usage in kB directly from /proc/<pid>/status (VmRSS)
+          if [[ -n "$child_pid" && -e "/proc/$child_pid/status" ]]; then
+            mem_kb=$(awk '/VmRSS:/ {print $2}' "/proc/$child_pid/status")
+            mem_gb=$(awk "BEGIN { printf \"%.1f\", $mem_kb / 1024 / 1024 }")
+          else
+            mem_gb="--"
           fi
 
           if [[ -f "$log_file" ]]; then
@@ -1227,9 +1384,18 @@ EOS
             latest_block="--"
           fi
 
-          # Peer count from tmux buffer
-          peer_count=$(tmux capture-pane -p -t "$session" | grep 'connected_peers=' | tail -n 1 | grep -o 'connected_peers=[0-9]\+' | cut -d= -f2)
-          [[ -z "$peer_count" ]] && peer_count="--"
+          # Peer count: robust extraction with fallback default value
+          if [[ -f "$log_file" ]]; then
+            last_line=$(tac "$log_file" | sed 's/\x1b\[[0-9;]*m//g' | grep -a 'connected_peers=' | grep -a 'connected_peers=[0-9]\+' | head -n 1 || echo "")
+            extracted=$(echo "$last_line" | sed -n 's/.*connected_peers=\([0-9]\+\).*/\1/p' || echo "")
+            if [[ "$extracted" =~ ^[0-9]+$ ]]; then
+              peer_count="$extracted"
+            else
+              peer_count="--"
+            fi
+          else
+            peer_count="--"
+          fi
 
           # Lag logic
           if [[ "$latest_block" =~ ^[0-9]+\.[0-9]+$ && "$NETWORK_HEIGHT" =~ ^[0-9]+\.[0-9]+$ ]]; then
@@ -1251,10 +1417,12 @@ EOS
             lag_color="${YELLOW}"
           fi
 
-          printf "%b | %-9s | %-9s | %-9s | %-9s | %-9s | %-5s | %-10b | %-5s\n" "$color" "$session" "$readable" "$cpu%" "$mem%" "$latest_block" "$lag" "$(echo -e "$lag_color$lag_status$RESET")" "$peer_count"
+          # Print with MEM % and GB as separate columns, fix Status/Peers columns alignment and format string/argument count
+          lag_display="$(echo -e "$lag_color$lag_status$RESET")"
+          printf "%b | %-9s | %-9s | %-9s | %-9s | %-9s | %-9s | %-5s | %-10s | %-9s\n" "$color" "$session" "$readable" "$cpu%" "$mem%" "$mem_gb" "$latest_block" "$lag" "$lag_display" "$peer_count"
         else
-          # Show default values for inactive/broken miners
-          printf "${DIM}❌ | %-9s | %-9s | %-9s | %-9s | %-9s | %-5s | %-10s | %-5s${RESET}\n" "$session" "--" "--" "--" "--" "--" "inactive" "--"
+          # Show default values for inactive/broken miners (10 columns)
+          printf "${DIM}❌ | %-9s | %-9s | %-9s | %-9s | %-9s | %-9s | %-5s | %-10s | %-9s${RESET}\n" "$session" "--" "--" "--" "--" "--" "--" "inactive" "--"
         fi
       done
 
@@ -1267,13 +1435,121 @@ EOS
     done
     continue
     ;;
-  9)
+  22)
     clear
     if ! command -v htop &> /dev/null; then
       echo -e "${YELLOW}htop is not installed. Installing now...${RESET}"
       sudo apt-get update && sudo apt-get install -y htop
     fi
-    htop
+    htop || true
+    read -n 1 -s -r -p $'\nPress any key to return to the main menu...'
+    continue
+    ;;
+
+  12)
+    clear
+    miner_dirs=$(find "$HOME/nockchain" -maxdepth 1 -type d -name "miner*" | sort -V)
+
+    if [[ -z "$miner_dirs" ]]; then
+      echo -e "${RED}❌ No miner directories found.${RESET}"
+      read -n 1 -s -r -p $'\nPress any key to return to menu...'
+      continue
+    fi
+
+    if ! command -v fzf &> /dev/null; then
+      echo -e "${YELLOW}fzf not found. Installing fzf...${RESET}"
+      sudo apt-get update && sudo apt-get install -y fzf
+      echo -e "${GREEN}fzf installed successfully.${RESET}"
+    fi
+
+    # Improved fzf-based miner log menu with status indicators and formatting
+    declare -a menu_entries=()
+    declare -A miner_logs
+
+    # Collect miner info into array of lines: "miner_id|log_path|status"
+    miner_info_lines=()
+    for dir in $miner_dirs; do
+      miner_id=$(basename "$dir" | grep -o '[0-9]\+')
+      log_path="$dir/miner${miner_id}.log"
+      service_name="nockchain-miner$miner_id"
+      if systemctl is-active --quiet "$service_name"; then
+        status_icon="🟢"
+      else
+        status_icon="🔴"
+      fi
+      miner_info_lines+=("$miner_id|$log_path|$status_icon")
+      miner_logs["miner$miner_id"]="$log_path"
+    done
+
+    # Sort by miner number
+    IFS=$'\n' sorted_info=($(printf "%s\n" "${miner_info_lines[@]}" | sort -t'|' -k1,1n))
+    unset IFS
+
+    # Build menu entries with formatting
+    for info in "${sorted_info[@]}"; do
+      miner_id=$(echo "$info" | cut -d'|' -f1)
+      log_path=$(echo "$info" | cut -d'|' -f2)
+      status_icon=$(echo "$info" | cut -d'|' -f3)
+      label="$(printf "%s %b%-8s%b %b[%s]%b" "$status_icon" "${BOLD_BLUE}" "miner$miner_id" "${RESET}" "${DIM}" "$log_path" "${RESET}")"
+      menu_entries+=("$label")
+    done
+
+    # Add Show all at the top and Cancel directly after, then the miners
+    menu_entries=("📡 Show all miner logs combined (live)" "↩️  Cancel and return to menu" "${menu_entries[@]}")
+
+    selected=$(printf "%s\n" "${menu_entries[@]}" | fzf --ansi --prompt="Select miner: " \
+      --pointer="👉" --marker="✓" \
+      --color=prompt:blue,fg+:cyan,bg+:238,pointer:green,marker:green \
+      --header=$'\nUse ↑ ↓ arrows or type to search. ENTER to confirm.\n')
+    plain_selected=$(echo -e "$selected" | sed 's/\x1b\[[0-9;]*m//g')
+    selected_miner=$(echo "$plain_selected" | grep -Eo 'miner[0-9]+' | head -n 1 || true)
+    selected_miner=$(echo "$selected_miner" | tr -d '\n\r')
+
+    if [[ -z "$selected" || "$selected" == *"Cancel and return to menu"* ]]; then
+      echo -e "${YELLOW}Returning to menu...${RESET}"
+      continue
+    elif [[ "$selected" == *"Show all miner logs"* ]]; then
+      echo -e "${CYAN}Streaming combined logs from all miners...${RESET}"
+      echo -e "${DIM}Press Ctrl+C to return to menu.${RESET}"
+      temp_log_script=$(mktemp)
+      cat > "$temp_log_script" <<'EOL'
+#!/bin/bash
+trap "exit 0" INT
+tail -f $(find "$HOME/nockchain" -maxdepth 1 -type d -name "miner*" -exec bash -c 'for d; do echo "$d/$(basename "$d").log"; done' _ {} +)
+EOL
+      chmod +x "$temp_log_script"
+      bash "$temp_log_script"
+      echo -e "${YELLOW}Log stream ended. Press any key to return to the main menu...${RESET}"
+      read -n 1 -s
+      rm -f "$temp_log_script"
+      continue
+    fi
+
+    # Extract miner name from selection (match e.g. "minerX")
+    miner_log=""
+    [[ -z "$selected_miner" || -z "${miner_logs[$selected_miner]:-}" ]] && {
+      echo -e "${RED}❌ Invalid selection. No log file found for: $selected_miner${RESET}"
+      read -n 1 -s -r -p $'\nPress any key to return to menu...'
+      continue
+    }
+    miner_log="${miner_logs[$selected_miner]}"
+
+    if [[ ! -f "$miner_log" ]]; then
+      echo -e "${RED}❌ Log file not found: ${DIM}${miner_log}${RESET}"
+      read -n 1 -s -r -p $'\nPress any key to return to menu...'
+      continue
+    fi
+    echo -e "${CYAN}Streaming logs for $selected_miner...${RESET}"
+    echo -e "${DIM}Press Ctrl+C to return to menu.${RESET}"
+    temp_log_script=$(mktemp)
+    cat > "$temp_log_script" <<EOL
+#!/bin/bash
+trap "echo -e '\n${YELLOW}Log stream ended. Press any key to return to the main menu...${RESET}'; read -n 1 -s; exit 0" INT
+tail -f "$miner_log"
+EOL
+    chmod +x "$temp_log_script"
+    bash "$temp_log_script"
+    rm -f "$temp_log_script"
     continue
     ;;
   *)
