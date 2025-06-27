@@ -40,13 +40,16 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
+Type=simple
 Restart=always
 RestartSec=5
 StartLimitIntervalSec=0
-Type=simple
 WorkingDirectory=$abs_dir
 User=root
 Environment="MINING_KEY=$MINER_KEY"
+Environment="RUST_LOG=info"
+MemoryMax=20G
+MemorySwapMax=5G
 ExecStart=/bin/bash $abs_script $miner_id
 
 [Install]
