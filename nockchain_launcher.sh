@@ -147,11 +147,23 @@ for i in $(find "$HOME/nockchain" -maxdepth 1 -type d -name "miner*" 2>/dev/null
     ((RUNNING_MINERS=RUNNING_MINERS+1))
   fi
 done
-MINER_FOLDERS=$(find "$HOME/nockchain" -maxdepth 1 -type d -name "miner*" 2>/dev/null | wc -l)
+if [[ -d "$HOME/nockchain" ]]; then
+  MINER_FOLDERS=$(find "$HOME/nockchain" -maxdepth 1 -type d -name "miner*" 2>/dev/null | wc -l)
+else
+  MINER_FOLDERS=0
+fi
+
 if (( RUNNING_MINERS > 0 )); then
   echo -e "${GREEN}🟢 $RUNNING_MINERS active miners${RESET} ${DIM}($MINER_FOLDERS total miners)${RESET}"
 else
   echo -e "${RED}🔴 No miners running${RESET} ${DIM}($MINER_FOLDERS total miners)${RESET}"
+fi
+
+# Show hourly backup service status
+if systemctl is-active --quiet nockchain-statejam-backup.timer; then
+  echo -e "${GREEN}🟢 Hourly state.jam backup is ACTIVE.${RESET}"
+else
+  echo -e "${RED}🔴 Hourly state.jam backup is NOT active.${RESET}"
 fi
 
  # Display current version of node and launcher, and update status
@@ -209,6 +221,7 @@ RAM_TOTAL=$(free -h | awk '/^Mem:/ {print $2}')
 printf "  ${CYAN}%-12s${RESET}%-20s\n" "CPU Load:" "$CPU_LOAD / $(nproc)"
 printf "  ${CYAN}%-12s${RESET}%-20s\n" "RAM Used:" "$RAM_USED / $RAM_TOTAL"
 printf "  ${CYAN}%-12s${RESET}%-20s\n" "Uptime:" "$(uptime -p)"
+# (Hourly backup service status now shown above with miner status)
 
 echo -e "\e[31m::════════════════════════════════════════════════════════\e[0m"
 echo ""
@@ -220,7 +233,8 @@ printf "${BOLD_BLUE}%-40s%-40s${RESET}\n" \
   "2) Update nockchain to latest version" "22) Monitor resource usage (htop)" \
   "3) Update nockchain-wallet only"       "" \
   "4) Update launcher script"             "" \
-  "5) Export or download state.jam file"      ""
+  "5) Export or download state.jam file"  "" \
+  "6) Hourly state.jam backup service"      ""
 
 # Full-width layout for Miner Operations
 echo -e ""
@@ -247,6 +261,139 @@ if [[ -z "$USER_CHOICE" ]]; then
 fi
 
 case "$USER_CHOICE" in
+  6)
+    clear
+    # Toggle systemd timer for periodic state.jam backup
+    BACKUP_SERVICE_FILE="/etc/systemd/system/nockchain-statejam-backup.service"
+    BACKUP_TIMER_FILE="/etc/systemd/system/nockchain-statejam-backup.timer"
+    BACKUP_SCRIPT="$HOME/nockchain/export_latest_state_jam.sh"
+
+    echo -e "${CYAN}🔄 Checking status of periodic state.jam backup service...${RESET}"
+    if systemctl is-active --quiet nockchain-statejam-backup.service; then
+      echo -e "${GREEN}🟢 statejam backup service is running.${RESET}"
+    else
+      echo -e "${RED}🔴 statejam backup service is not running.${RESET}"
+      echo -e "${DIM}The timer is enabled but the service has not executed yet or is between runs.${RESET}"
+    fi
+    if systemctl is-enabled --quiet nockchain-statejam-backup.timer 2>/dev/null; then
+      echo -e "${GREEN}✅ Periodic backup is currently ENABLED.${RESET}"
+      echo -e "${DIM}To check timer status: systemctl list-timers --all | grep nockchain-statejam-backup${RESET}"
+      echo -e "${DIM}To check recent logs: journalctl -u nockchain-statejam-backup.service --since \"2 hours ago\"${RESET}"
+      echo ""
+      echo -e "${YELLOW}Do you want to disable it? (y/n)${RESET}"
+      while true; do
+        read -rp "$(echo -e "${BOLD_BLUE}> ${RESET}")" DISABLE_BACKUP
+        [[ "$DISABLE_BACKUP" =~ ^[YyNn]$ ]] && break
+        echo -e "${RED}❌ Please enter y or n.${RESET}"
+      done
+      if [[ "$DISABLE_BACKUP" =~ ^[Yy]$ ]]; then
+        sudo systemctl stop nockchain-statejam-backup.timer
+        sudo systemctl disable nockchain-statejam-backup.timer
+        echo -e "${GREEN}✅ Periodic state.jam backup DISABLED.${RESET}"
+      else
+        echo -e "${CYAN}Backup service remains enabled.${RESET}"
+      fi
+      echo -e "${YELLOW}Press any key to return to the main menu...${RESET}"
+      read -n 1 -s
+      continue
+    else
+      echo -e "${RED}❌ Periodic backup is currently DISABLED.${RESET}"
+      echo -e "${YELLOW}Do you want to enable it? (y/n)${RESET}"
+      while true; do
+        read -rp "$(echo -e "${BOLD_BLUE}> ${RESET}")" ENABLE_BACKUP
+        [[ "$ENABLE_BACKUP" =~ ^[YyNn]$ ]] && break
+        echo -e "${RED}❌ Please enter y or n.${RESET}"
+      done
+      if [[ ! "$ENABLE_BACKUP" =~ ^[Yy]$ ]]; then
+        echo -e "${CYAN}Backup service remains disabled.${RESET}"
+        echo -e "${YELLOW}Press any key to return to the main menu...${RESET}"
+        read -n 1 -s
+        continue
+      fi
+      # Write export_latest_state_jam.sh with improved logic (Option 5 style)
+      if [[ ! -f "$BACKUP_SCRIPT" ]]; then
+        cat > "$BACKUP_SCRIPT" <<'EOS'
+#!/bin/bash
+# export_latest_state_jam.sh
+# Finds the miner with the highest block and safely exports a fresh state.jam
+set -euo pipefail
+
+SRC=""
+HIGHEST=0
+HIGHEST_BLOCK=""
+
+for d in "$HOME/nockchain"/miner*; do
+  [[ -d "$d" ]] || continue
+  log="$d/$(basename "$d").log"
+  if [[ -f "$log" ]]; then
+    blk=$(grep -a 'added to validated blocks at' "$log" 2>/dev/null | tail -n 1 | grep -oP 'at\s+\K[0-9]+\.[0-9]+')
+    if [[ "$blk" =~ ^([0-9]+)\.([0-9]+)$ ]]; then
+      num=$((10#${BASH_REMATCH[1]} * 1000 + 10#${BASH_REMATCH[2]}))
+      if (( num > HIGHEST )); then
+        HIGHEST=$num
+        HIGHEST_BLOCK=$blk
+        SRC="$d"
+      fi
+    fi
+  fi
+done
+
+if [[ -z "$SRC" ]]; then
+  echo "[$(date)] ❌ No suitable miner folder found." >> "$HOME/nockchain/statejam_backup.log"
+  exit 1
+fi
+
+TMP="$HOME/nockchain/miner-export"
+OUT="$HOME/nockchain/state.jam"
+rm -rf "$TMP"
+cp -a "$SRC" "$TMP"
+
+cd "$TMP"
+"$HOME/nockchain/target/release/nockchain" --export-state-jam "$OUT" >> "$HOME/nockchain/statejam_backup.log" 2>&1
+cd "$HOME/nockchain"
+rm -rf "$TMP"
+
+echo "[$(date)] ✅ Exported fresh state.jam from block $HIGHEST_BLOCK to $OUT" >> "$HOME/nockchain/statejam_backup.log"
+EOS
+        chmod +x "$BACKUP_SCRIPT"
+      fi
+      # Write systemd service file
+      sudo bash -c "cat > '$BACKUP_SERVICE_FILE'" <<EOS
+[Unit]
+Description=Export latest state.jam from all miners to ~/nockchain/state.jam
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=$USER
+ExecStart=$BACKUP_SCRIPT
+EOS
+      # Write systemd timer file
+      sudo bash -c "cat > '$BACKUP_TIMER_FILE'" <<EOS
+[Unit]
+Description=Run state.jam export every hour
+
+[Timer]
+OnCalendar=hourly
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOS
+      sudo systemctl daemon-reload
+      sudo systemctl enable --now nockchain-statejam-backup.timer
+      echo -e "${GREEN}✅ Periodic state.jam backup ENABLED (every hour).${RESET}"
+      echo -e "${CYAN}Backup script: ${DIM}$BACKUP_SCRIPT${RESET}"
+      echo -e "${CYAN}Backup location: ${DIM}~/nockchain/state.jam${RESET}"
+      echo -e "${CYAN}To check timer status: ${DIM}systemctl status nockchain-statejam-backup.timer${RESET}"
+      echo -e "${CYAN}To check backup logs: ${DIM}journalctl -u nockchain-statejam-backup.service -e${RESET}"
+      echo -e "${CYAN}To check next/last run: ${DIM}systemctl list-timers --all | grep nockchain-statejam-backup${RESET}"
+      echo -e "${CYAN}To check execution logs: ${DIM}journalctl -u nockchain-statejam-backup.service --since \"2 hours ago\"${RESET}"
+      echo -e "${YELLOW}Press any key to return to the main menu...${RESET}"
+      read -n 1 -s
+      continue
+    fi
+    ;;
   5)
     clear
 
@@ -1837,3 +1984,28 @@ EOL
 esac
 
 done
+
+#
+# Function: export_latest_state_jam
+# (For use in backup service or manual invocation)
+export_latest_state_jam() {
+  latest_state_file=""
+  highest_block=-1
+  for dir in "$HOME/nockchain"/miner*; do
+    [ -d "$dir" ] || continue
+    state_file="$dir/state.jam"
+    if [[ -f "$state_file" ]]; then
+      block=$(strings "$state_file" | grep -oE 'block [0-9]+' | grep -oE '[0-9]+' | head -n 1)
+      if [[ "$block" =~ ^[0-9]+$ ]] && (( block > highest_block )); then
+        highest_block=$block
+        latest_state_file="$state_file"
+      fi
+    fi
+  done
+  if [[ -n "$latest_state_file" && -f "$latest_state_file" ]]; then
+    cp "$latest_state_file" "$HOME/nockchain/state_backup.jam"
+    echo "[$(date)] Copied state.jam (block $highest_block) to ~/nockchain/state_backup.jam"
+  else
+    echo "[$(date)] No valid state.jam found for backup."
+  fi
+}
