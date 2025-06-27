@@ -8,6 +8,15 @@ BOLD_BLUE="\e[1;34m"
 DIM="\e[2m"
 RESET="\e[0m"
 
+# Helper: Ensure fzf is installed
+ensure_fzf_installed() {
+  if ! command -v fzf &> /dev/null; then
+    echo -e "${YELLOW}fzf not found. Installing fzf...${RESET}"
+    sudo apt-get update && sudo apt-get install -y fzf
+    echo -e "${GREEN}fzf installed successfully.${RESET}"
+  fi
+}
+
 set -euo pipefail
 trap 'exit_code=$?; [[ $exit_code -eq 130 ]] && exit 130; [[ $exit_code -ne 0 ]] && echo -e "${RED}(FATAL ERROR) Script exited unexpectedly with code $exit_code on line $LINENO.${RESET}"; caller 0' ERR
 
@@ -48,8 +57,6 @@ WorkingDirectory=$abs_dir
 User=root
 Environment="MINING_KEY=$MINER_KEY"
 Environment="RUST_LOG=info"
-MemoryMax=20G
-MemorySwapMax=5G
 ExecStart=/bin/bash $abs_script $miner_id
 
 [Install]
@@ -234,7 +241,7 @@ printf "${BOLD_BLUE}%-40s%-40s${RESET}\n" \
   "3) Update nockchain-wallet only"       "" \
   "4) Update launcher script"             "" \
   "5) Export or download state.jam file"  "" \
-  "6) Hourly state.jam backup service"      ""
+  "6) Manage periodic state.jam backup"     ""
 
 # Full-width layout for Miner Operations
 echo -e ""
@@ -267,52 +274,21 @@ case "$USER_CHOICE" in
     BACKUP_SERVICE_FILE="/etc/systemd/system/nockchain-statejam-backup.service"
     BACKUP_TIMER_FILE="/etc/systemd/system/nockchain-statejam-backup.timer"
     BACKUP_SCRIPT="$HOME/nockchain/export_latest_state_jam.sh"
-
-    echo -e "${CYAN}🔄 Checking status of periodic state.jam backup service...${RESET}"
-    if systemctl is-active --quiet nockchain-statejam-backup.service; then
-      echo -e "${GREEN}🟢 statejam backup service is running.${RESET}"
-    else
-      echo -e "${RED}🔴 statejam backup service is not running.${RESET}"
-      echo -e "${DIM}The timer is enabled but the service has not executed yet or is between runs.${RESET}"
-    fi
-    if systemctl is-enabled --quiet nockchain-statejam-backup.timer 2>/dev/null; then
-      echo -e "${GREEN}✅ Periodic backup is currently ENABLED.${RESET}"
-      echo -e "${DIM}To check timer status: systemctl list-timers --all | grep nockchain-statejam-backup${RESET}"
-      echo -e "${DIM}To check recent logs: journalctl -u nockchain-statejam-backup.service --since \"2 hours ago\"${RESET}"
-      echo ""
-      echo -e "${YELLOW}Do you want to disable it? (y/n)${RESET}"
-      while true; do
-        read -rp "$(echo -e "${BOLD_BLUE}> ${RESET}")" DISABLE_BACKUP
-        [[ "$DISABLE_BACKUP" =~ ^[YyNn]$ ]] && break
-        echo -e "${RED}❌ Please enter y or n.${RESET}"
-      done
-      if [[ "$DISABLE_BACKUP" =~ ^[Yy]$ ]]; then
-        sudo systemctl stop nockchain-statejam-backup.timer
-        sudo systemctl disable nockchain-statejam-backup.timer
-        echo -e "${GREEN}✅ Periodic state.jam backup DISABLED.${RESET}"
-      else
-        echo -e "${CYAN}Backup service remains enabled.${RESET}"
-      fi
-      echo -e "${YELLOW}Press any key to return to the main menu...${RESET}"
-      read -n 1 -s
+    # Ensure fzf is installed
+    ensure_fzf_installed
+    # Present fzf menu: start/stop/restart/cancel (with improved entries)
+    menu_entries=("↩️  Cancel and return to main menu" "🟢 Start backup service" "🔄 Restart backup service" "🔴 Stop backup service")
+    selected=$(printf "%s\n" "${menu_entries[@]}" | fzf --prompt="Choose action for backup service: " \
+      --pointer="👉" --color=prompt:blue,fg+:cyan,bg+:238,pointer:green,marker:green \
+      --header=$'\nUse ↑ ↓ arrows to select. ENTER to confirm.\nUseful commands:\n  - systemctl status nockchain-statejam-backup.timer\n  - journalctl -u nockchain-statejam-backup.service -e\n')
+    [[ -z "$selected" ]] && selected="↩️  Cancel and return to main menu"
+    if [[ "$selected" == "↩️  Cancel and return to main menu" ]]; then
       continue
-    else
-      echo -e "${RED}❌ Periodic backup is currently DISABLED.${RESET}"
-      echo -e "${YELLOW}Do you want to enable it? (y/n)${RESET}"
-      while true; do
-        read -rp "$(echo -e "${BOLD_BLUE}> ${RESET}")" ENABLE_BACKUP
-        [[ "$ENABLE_BACKUP" =~ ^[YyNn]$ ]] && break
-        echo -e "${RED}❌ Please enter y or n.${RESET}"
-      done
-      if [[ ! "$ENABLE_BACKUP" =~ ^[Yy]$ ]]; then
-        echo -e "${CYAN}Backup service remains disabled.${RESET}"
-        echo -e "${YELLOW}Press any key to return to the main menu...${RESET}"
-        read -n 1 -s
-        continue
-      fi
-      # Write export_latest_state_jam.sh with improved logic (Option 5 style)
-      if [[ ! -f "$BACKUP_SCRIPT" ]]; then
-        cat > "$BACKUP_SCRIPT" <<'EOS'
+    fi
+    # Helper: Create backup script, always overwrite
+    create_backup_script() {
+      echo "[INFO] Overwriting backup script at $BACKUP_SCRIPT..."
+      cat > "$BACKUP_SCRIPT" <<'EOS'
 #!/bin/bash
 # export_latest_state_jam.sh
 # Finds the miner with the highest block and safely exports a fresh state.jam
@@ -343,21 +319,35 @@ if [[ -z "$SRC" ]]; then
   exit 1
 fi
 
+# Log the highest block/miner found
+echo "[$(date)] 🔍 Found miner with highest block: $HIGHEST_BLOCK at $SRC" >> "$HOME/nockchain/statejam_backup.log"
+echo "[INFO] Exporting from miner at $SRC (block $HIGHEST_BLOCK)..."
+
 TMP="$HOME/nockchain/miner-export"
 OUT="$HOME/nockchain/state.jam"
+echo "[$(date)] 📁 Creating temporary clone at $TMP" >> "$HOME/nockchain/statejam_backup.log"
+echo "[INFO] Creating temporary copy of miner folder at $TMP..."
 rm -rf "$TMP"
 cp -a "$SRC" "$TMP"
 
 cd "$TMP"
+echo "[$(date)] 🧠 Running export-state-jam command..." >> "$HOME/nockchain/statejam_backup.log"
+echo "[INFO] Running nockchain --export-state-jam to $OUT..."
 "$HOME/nockchain/target/release/nockchain" --export-state-jam "$OUT" >> "$HOME/nockchain/statejam_backup.log" 2>&1
 cd "$HOME/nockchain"
+echo "[$(date)] 🧹 Cleaning up temporary folder..." >> "$HOME/nockchain/statejam_backup.log"
+echo "[INFO] Cleaning up temporary folder $TMP..."
 rm -rf "$TMP"
 
-echo "[$(date)] ✅ Exported fresh state.jam from block $HIGHEST_BLOCK to $OUT" >> "$HOME/nockchain/statejam_backup.log"
+echo "[$(date)] ✅ Exported fresh state.jam from block $HIGHEST_BLOCK to $OUT" | tee -a "$HOME/nockchain/statejam_backup.log"
 EOS
+      chmod +x "$BACKUP_SCRIPT"
+      if [[ ! -x "$BACKUP_SCRIPT" ]]; then
         chmod +x "$BACKUP_SCRIPT"
       fi
-      # Write systemd service file
+    }
+    # Helper: Write systemd service/timer
+    create_backup_systemd_files() {
       sudo bash -c "cat > '$BACKUP_SERVICE_FILE'" <<EOS
 [Unit]
 Description=Export latest state.jam from all miners to ~/nockchain/state.jam
@@ -366,9 +356,8 @@ After=network-online.target
 [Service]
 Type=oneshot
 User=$USER
-ExecStart=$BACKUP_SCRIPT
+ExecStart=/root/nockchain/export_latest_state_jam.sh
 EOS
-      # Write systemd timer file
       sudo bash -c "cat > '$BACKUP_TIMER_FILE'" <<EOS
 [Unit]
 Description=Run state.jam export every hour
@@ -381,16 +370,129 @@ Persistent=true
 WantedBy=timers.target
 EOS
       sudo systemctl daemon-reload
+    }
+    # Helper: Enable and start timer
+    enable_and_start_timer() {
       sudo systemctl enable --now nockchain-statejam-backup.timer
-      echo -e "${GREEN}✅ Periodic state.jam backup ENABLED (every hour).${RESET}"
-      echo -e "${CYAN}Backup script: ${DIM}$BACKUP_SCRIPT${RESET}"
-      echo -e "${CYAN}Backup location: ${DIM}~/nockchain/state.jam${RESET}"
-      echo -e "${CYAN}To check timer status: ${DIM}systemctl status nockchain-statejam-backup.timer${RESET}"
-      echo -e "${CYAN}To check backup logs: ${DIM}journalctl -u nockchain-statejam-backup.service -e${RESET}"
-      echo -e "${CYAN}To check next/last run: ${DIM}systemctl list-timers --all | grep nockchain-statejam-backup${RESET}"
-      echo -e "${CYAN}To check execution logs: ${DIM}journalctl -u nockchain-statejam-backup.service --since \"2 hours ago\"${RESET}"
+      if ! systemctl list-timers --all | grep -q "nockchain-statejam-backup.timer"; then
+        echo -e "${RED}❌ Failed to enable backup timer.${RESET}"
+        return 1
+      fi
+      return 0
+    }
+    # Helper: Stop and disable timer
+    stop_and_disable_timer() {
+      sudo systemctl stop nockchain-statejam-backup.timer
+      sudo systemctl disable nockchain-statejam-backup.timer
+    }
+    # Helper: Dry run log streaming
+    dry_run_and_stream_log() {
+      echo -e "${CYAN}▶ Running backup script manually to verify setup...${RESET}"
+      echo -e "${CYAN}▶ Output log: ${DIM}$HOME/nockchain/statejam_backup.log${RESET}"
+      rm -f "$HOME/nockchain/statejam_backup.log"
+      touch "$HOME/nockchain/statejam_backup.log"
+
+      # --- BEGIN: Show miner block heights before backup ---
+      echo -e "${DIM}Detecting highest block from available miners...${RESET}"
+      miner_logs=()
+      for d in "$HOME/nockchain"/miner*; do
+        [[ -d "$d" ]] || continue
+        log="$d/$(basename "$d").log"
+        blk=$(grep -a 'added to validated blocks at' "$log" 2>/dev/null | tail -n 1 | grep -oP 'at\s+\K[0-9]+\.[0-9]+')
+        if [[ -n "$blk" ]]; then
+          echo -e "${GREEN}🟢 Detected ${CYAN}$(basename "$d")${RESET} at block ${BOLD_BLUE}$blk${RESET}"
+          miner_logs+=("$blk $d")
+        fi
+      done
+      if [[ ${#miner_logs[@]} -gt 0 ]]; then
+        highest=$(printf "%s\n" "${miner_logs[@]}" | sort -nr | head -n1)
+        blk=$(echo "$highest" | awk '{print $1}')
+        dir=$(echo "$highest" | cut -d' ' -f2-)
+        echo -e "${GREEN}✅ Backing up from ${CYAN}$(basename "$dir")${RESET} at block ${BOLD_BLUE}$blk${RESET}"
+      else
+        echo -e "${RED}❌ No miner logs found with validated blocks.${RESET}"
+      fi
+      echo ""
+      # --- END: Show miner block heights before backup ---
+
+      tail -f "$HOME/nockchain/statejam_backup.log" &
+      TAIL_PID=$!
+      bash "$BACKUP_SCRIPT"
+      sleep 1
+      kill $TAIL_PID
+      echo -e ""
+      echo -e "${GREEN}✅ Backup script executed successfully.${RESET}"
+      echo ""
       echo -e "${YELLOW}Press any key to return to the main menu...${RESET}"
       read -n 1 -s
+    }
+    # Handle selection
+    if [[ "$selected" == "🟢 Start backup service" ]]; then
+      echo -e "${CYAN}▶ Creating backup script...${RESET}"
+      create_backup_script
+      if [[ ! -f "$BACKUP_SCRIPT" || ! -x "$BACKUP_SCRIPT" ]]; then
+        echo -e "${RED}❌ Export script was not created. Aborting.${RESET}"
+        read -n 1 -s
+        continue
+      fi
+      echo -e "${CYAN}▶ Writing systemd service and timer files...${RESET}"
+      create_backup_systemd_files
+      if enable_and_start_timer; then
+        echo -e "${CYAN}▶ Starting backup timer service...${RESET}"
+        echo -e ""
+        echo -e "${CYAN}▶ Backup service setup complete.${RESET}"
+        echo -e "${CYAN}▶ Service: statejam backup${RESET}"
+        echo -e "${CYAN}▶ Status: ENABLED and scheduled every hour${RESET}"
+        echo -e "${CYAN}▶ Backup script: ${DIM}$BACKUP_SCRIPT${RESET}"
+        echo -e "${CYAN}▶ Target location: ${DIM}~/nockchain/state.jam${RESET}"
+        echo -e ""
+        echo -e "${CYAN}▶ Performing dry run to verify backup...${RESET}"
+        dry_run_and_stream_log
+      else
+        echo -e "${RED}❌ Failed to enable/launch backup timer.${RESET}"
+        read -n 1 -s
+        continue
+      fi
+      continue
+    elif [[ "$selected" == "🔴 Stop backup service" ]]; then
+      echo -e "${CYAN}🛑 Stopping periodic state.jam backup service...${RESET}"
+      stop_and_disable_timer
+      echo -e "${GREEN}✅ Disabled nockchain-statejam-backup.timer${RESET}"
+      echo -e "${GREEN}✅ Periodic state.jam backup is now DISABLED.${RESET}"
+      echo ""
+      echo -e "${YELLOW}Press any key to return to the main menu...${RESET}"
+      read -n 1 -s
+      continue
+    elif [[ "$selected" == "🔄 Restart backup service" ]]; then
+      echo -e "${CYAN}▶ Stopping backup service if running...${RESET}"
+      stop_and_disable_timer
+      echo -e "${BOLD_BLUE}▶ Creating backup script...${RESET}"
+      rm -f "$BACKUP_SCRIPT"
+      create_backup_script
+      if [[ ! -f "$BACKUP_SCRIPT" || ! -x "$BACKUP_SCRIPT" ]]; then
+        echo -e "${RED}❌ Export script was not created. Aborting.${RESET}"
+        read -n 1 -s
+        continue
+      fi
+      echo -e "${CYAN}▶ Writing systemd service and timer files...${RESET}"
+      rm -f "$BACKUP_SERVICE_FILE" "$BACKUP_TIMER_FILE"
+      create_backup_systemd_files
+      if enable_and_start_timer; then
+        echo -e "${CYAN}▶ Starting backup timer service...${RESET}"
+        echo -e ""
+        echo -e "${CYAN}▶ Backup service setup complete.${RESET}"
+        echo -e "${CYAN}▶ Service: statejam backup${RESET}"
+        echo -e "${CYAN}▶ Status: ENABLED and scheduled every hour${RESET}"
+        echo -e "${CYAN}▶ Backup script:${RESET} ${DIM}$BACKUP_SCRIPT${RESET}"
+        echo -e "${CYAN}▶ Target location: ${DIM}~/nockchain/state.jam${RESET}"
+        echo -e ""
+        echo -e "${CYAN}▶ Performing dry run to verify backup...${RESET}"
+        dry_run_and_stream_log
+      else
+        echo -e "${RED}❌ Failed to enable/launch backup timer.${RESET}"
+        read -n 1 -s
+        continue
+      fi
       continue
     fi
     ;;
@@ -399,17 +501,7 @@ EOS
 
     miner_dirs=$(find "$HOME/nockchain" -maxdepth 1 -type d -name "miner*" | sort -V)
 
-    if [[ -z "$miner_dirs" ]]; then
-      echo -e "${RED}❌ No miner directories found.${RESET}"
-      read -n 1 -s -r -p $'\nPress any key to return to menu...'
-      continue
-    fi
-
-    if ! command -v fzf &> /dev/null; then
-      echo -e "${YELLOW}fzf not found. Installing fzf...${RESET}"
-      sudo apt-get update && sudo apt-get install -y fzf
-      echo -e "${GREEN}fzf installed successfully.${RESET}"
-    fi
+    ensure_fzf_installed
 
     # Check latest Google Drive block (re-used for menu display)
     # Try to use gdown's Python API for robustness if available, else fallback to CLI
@@ -488,6 +580,7 @@ except Exception as e:
       --header=$'\nUse ↑ ↓ arrows to navigate. ENTER to confirm.\n')
 
     if [[ "$selected" == *"Google Drive"* ]]; then
+      clear
       echo -e "${CYAN}📦 Step 1/4: Verifying required tools...${RESET}"
       echo -e "${DIM}Checking for: wget, gdown, pip3...${RESET}"
       for tool in wget gdown pip3; do
@@ -661,6 +754,7 @@ EOF
     fi
 
     if [[ "$selected" == *"Download latest state.jam from GitHub"* ]]; then
+      clear
       echo -e "${CYAN}📥 Step 1/3: Create temp folder, Initializing Git and GIT LFS...${RESET}"
       TMP_CLONE="$HOME/nockchain/tmp_launcher_clone"
       rm -rf "$TMP_CLONE"
@@ -746,6 +840,7 @@ EOF
     read -n 1 -s
     continue
     ;;
+
   21)
     clear
     echo -e "${CYAN}System Diagnostics${RESET}"
@@ -1554,6 +1649,7 @@ EOS
     ;;
   14)
     clear
+    ensure_fzf_installed
     all_miners=()
     for d in "$HOME/nockchain"/miner*; do
       [ -d "$d" ] || continue
@@ -1566,10 +1662,11 @@ EOS
     done
     IFS=$'\n' sorted_miners=($(printf "%s\n" "${all_miners[@]}" | sort -k2 -V))
     unset IFS
-    if ! command -v fzf &> /dev/null; then
-      echo -e "${YELLOW}fzf not found. Installing fzf...${RESET}"
-      sudo apt-get update && sudo apt-get install -y fzf
-      echo -e "${GREEN}fzf installed successfully.${RESET}"
+    # Check if there are any miner directories at all
+    if [[ ${#sorted_miners[@]} -eq 0 ]]; then
+      echo -e "${YELLOW}No miner directories found. Nothing to restart.${RESET}"
+      read -n 1 -s -r -p $'\nPress any key to return to the main menu...'
+      continue
     fi
     # Build styled menu_entries for restart
     declare -a menu_entries=()
@@ -1595,6 +1692,12 @@ EOS
       # Extract miner names from styled selection
       TARGET_MINERS=$(echo "$selected" | grep -Eo 'miner[0-9]+')
     fi
+    # Check if any miners were selected
+    if [[ -z "$TARGET_MINERS" ]]; then
+      echo -e "${YELLOW}No miners selected. Nothing to restart.${RESET}"
+      read -n 1 -s -r -p $'\nPress any key to return to the main menu...'
+      continue
+    fi
     echo -e "${YELLOW}You selected:${RESET}"
     for miner in $TARGET_MINERS; do
       echo -e "${CYAN}- $miner${RESET}"
@@ -1610,9 +1713,13 @@ EOS
       miner_num=$(echo "$miner" | grep -o '[0-9]\+')
       echo -e "${CYAN}Restarting $miner...${RESET}"
       sudo systemctl restart nockchain-miner$miner_num
-      start_miner_service $miner_num
+      # Check if restart was successful
+      if systemctl is-active --quiet nockchain-miner$miner_num; then
+        echo -e "${GREEN}  ✅ $miner restarted successfully.${RESET}"
+      else
+        echo -e "${RED}  ❌ Failed to restart $miner. Check logs with:${RESET} ${CYAN}journalctl -u nockchain-miner$miner_num -e${RESET}"
+      fi
     done
-    echo -e "${GREEN}✅ Selected miners have been restarted via systemd.${RESET}"
     echo -e "${CYAN}To check status: ${DIM}systemctl status nockchain-minerX${RESET}"
     echo -e "${CYAN}To view logs:    ${DIM}tail -f ~/nockchain/minerX/minerX.log${RESET}"
     echo -e "${YELLOW}Press any key to return to the main menu...${RESET}"
@@ -1621,6 +1728,7 @@ EOS
     ;;
   15)
     clear
+    ensure_fzf_installed
     all_miners=()
     for d in "$HOME/nockchain"/miner*; do
       [ -d "$d" ] || continue
@@ -1633,15 +1741,16 @@ EOS
     done
     IFS=$'\n' sorted_miners=($(printf "%s\n" "${all_miners[@]}" | sort -k2 -V))
     unset IFS
-    if ! command -v fzf &> /dev/null; then
-      echo -e "${YELLOW}fzf not found. Installing fzf...${RESET}"
-      sudo apt-get update && sudo apt-get install -y fzf
-      echo -e "${GREEN}fzf installed successfully.${RESET}"
-    fi
     running_miners=()
     for entry in "${sorted_miners[@]}"; do
       [[ "$entry" =~ ^🟢 ]] && running_miners+=("$entry")
     done
+    # Check if there are any running miners at all
+    if [[ ${#running_miners[@]} -eq 0 ]]; then
+      echo -e "${YELLOW}No running miners found. Nothing to stop.${RESET}"
+      read -n 1 -s -r -p $'\nPress any key to return to the main menu...'
+      continue
+    fi
     # Build styled menu_entries for stop
     declare -a menu_entries=()
     menu_entries+=("🛑 Stop all running miners")
@@ -1665,6 +1774,12 @@ EOS
     else
       TARGET_MINERS=$(echo "$selected" | grep -Eo 'miner[0-9]+')
     fi
+    # Check if any miners were selected
+    if [[ -z "$TARGET_MINERS" ]]; then
+      echo -e "${YELLOW}No miners selected. Nothing to stop.${RESET}"
+      read -n 1 -s -r -p $'\nPress any key to return to the main menu...'
+      continue
+    fi
     echo -e "${YELLOW}You selected:${RESET}"
     for miner in $TARGET_MINERS; do
       echo -e "${CYAN}- $miner${RESET}"
@@ -1680,14 +1795,26 @@ EOS
       miner_num=$(echo "$miner" | grep -o '[0-9]\+')
       echo -e "${CYAN}Stopping $miner...${RESET}"
       sudo systemctl stop nockchain-miner$miner_num
+      # Check if stop was successful
+      if ! systemctl is-active --quiet nockchain-miner$miner_num; then
+        echo -e "${GREEN}  ✅ $miner stopped successfully.${RESET}"
+      else
+        echo -e "${RED}  ❌ Failed to stop $miner. Check logs with:${RESET} ${CYAN}journalctl -u nockchain-miner$miner_num -e${RESET}"
+      fi
     done
-    echo -e "${GREEN}✅ Selected miners have been stopped via systemd.${RESET}"
     echo -e "${YELLOW}Press any key to return to the main menu...${RESET}"
     read -n 1 -s
     continue
     ;;
   11)
     clear
+    # Check for miner directories before proceeding to live monitor
+    miner_dirs=$(find "$HOME/nockchain" -maxdepth 1 -type d -name "miner*" 2>/dev/null)
+    if [[ -z "$miner_dirs" ]]; then
+      echo -e "${YELLOW}No miners found. Nothing to monitor.${RESET}"
+      read -n 1 -s -r -p $'\nPress any key to return to the main menu...'
+      continue
+    fi
     # Calculate total system memory in GB for MEM % -> GB conversion (outside the loop, only once)
     TOTAL_MEM_KB=$(grep MemTotal /proc/meminfo | awk '{print $2}')
     TOTAL_MEM_GB=$(awk "BEGIN { printf \"%.1f\", $TOTAL_MEM_KB/1024/1024 }")
