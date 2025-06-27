@@ -261,6 +261,40 @@ case "$USER_CHOICE" in
       echo -e "${GREEN}fzf installed successfully.${RESET}"
     fi
 
+    # Check latest Google Drive block (re-used for menu display)
+    # Try to use gdown's Python API for robustness if available, else fallback to CLI
+    GD_FILE_LIST=""
+    GDFOLDER="https://drive.google.com/drive/folders/1aEYZwmg4isTuYXWFn9gKPl92-pYndwUw"
+    # Use a temp file for the log, in case fallback is needed
+    TMP_DRIVE_LIST_LOG="/tmp/gdown_list_menu.log"
+    if python3 -c 'import gdown' 2>/dev/null; then
+      GD_FILE_LIST=$(python3 -c "
+import gdown, sys
+try:
+    files = gdown._list_folder('$GDFOLDER')
+    for f in files:
+        if f['name'].endswith('.jam'):
+            print(f[\"id\"], f[\"name\"])
+except Exception as e:
+    sys.exit(0)
+" 2>/dev/null || true)
+    fi
+    if [[ -z "$GD_FILE_LIST" ]]; then
+      # fallback to gdown CLI, robust parsing, output errors to log file
+      GD_FILE_LIST=$(gdown --folder "$GDFOLDER" --list-only 2>"$TMP_DRIVE_LIST_LOG" | grep '.jam' | awk '{print $1, $(NF)}' || true)
+    fi
+    # Default to empty string for GD_LATEST_BLOCK
+    GD_LATEST_BLOCK=""
+    if [[ -n "$GD_FILE_LIST" ]]; then
+      # Remove .jam suffix, extract numbers, sort numerically, pick the highest
+      GD_LATEST_BLOCK=$(echo "$GD_FILE_LIST" | awk '{print $2}' | sed 's/[^0-9]*//g' | sort -n | tail -n 1)
+      [[ -z "$GD_LATEST_BLOCK" ]] && GD_LATEST_BLOCK="unknown"
+    else
+      GD_LATEST_BLOCK="unknown"
+    fi
+    # Fallback if still empty
+    [[ -z "$GD_LATEST_BLOCK" ]] && GD_LATEST_BLOCK="unknown"
+
     # Build formatted fzf menu showing miner name and latest block height, with status icon
     declare -a menu_entries=()
     declare -A miner_dirs_map
@@ -277,6 +311,7 @@ case "$USER_CHOICE" in
       BLOCK_COMMIT_VERSION="unknown"
     fi
     GITHUB_COMMIT_DISPLAY="📦 Download latest state.jam from GitHub (block $BLOCK_COMMIT_VERSION)"
+    GD_COMMIT_DISPLAY="📥 Download latest state.jam from Google Drive (official)"
 
     for dir in $miner_dirs; do
       miner_id=$(basename "$dir" | grep -o '[0-9]\+')
@@ -296,12 +331,184 @@ case "$USER_CHOICE" in
       menu_entries+=("$label")
       miner_dirs_map["$miner_name"]="$dir"
     done
-
-    menu_entries=("↩️  Cancel and return to menu" "$GITHUB_COMMIT_DISPLAY" "${menu_entries[@]}")
+    menu_entries=("↩️  Cancel and return to menu" "$GD_COMMIT_DISPLAY" "$GITHUB_COMMIT_DISPLAY" "${menu_entries[@]}")
 
     selected=$(printf "%s\n" "${menu_entries[@]}" | fzf --ansi --prompt="Select miner to export from: " \
       --pointer="👉" --color=prompt:blue,fg+:cyan,bg+:238,pointer:green,marker:green \
       --header=$'\nUse ↑ ↓ arrows to navigate. ENTER to confirm.\n')
+
+    if [[ "$selected" == *"Google Drive"* ]]; then
+      echo -e "${CYAN}📦 Step 1/4: Verifying required tools...${RESET}"
+      echo -e "${DIM}Checking for: wget, gdown, pip3...${RESET}"
+      for tool in wget gdown pip3; do
+        if command -v "$tool" &>/dev/null; then
+          echo -e "${GREEN}✔ $tool found${RESET}"
+        else
+          echo -e "${YELLOW}⚠ $tool not found. Installing...${RESET}"
+        fi
+      done
+      # Step 1: Try gdrive CLI, else fallback to scraping Google Drive folder page and use gdown
+      TMP_CLONE="$HOME/nockchain/tmp_drive_download"
+      rm -rf "$TMP_CLONE"
+      mkdir -p "$TMP_CLONE"
+
+      GDRIVE_FOLDER_ID="1aEYZwmg4isTuYXWFn9gKPl92-pYndwUw"
+      GDRIVE_FOLDER_URL="https://drive.google.com/drive/folders/$GDRIVE_FOLDER_ID"
+
+      use_gdrive_cli=0
+      if command -v gdrive &>/dev/null; then
+        GDRIVE_BIN="$(command -v gdrive)"
+        if [[ -x "$GDRIVE_BIN" ]] && "$GDRIVE_BIN" version &>/dev/null; then
+          use_gdrive_cli=1
+        fi
+      fi
+
+      if [[ "$use_gdrive_cli" == "1" ]]; then
+        echo ""
+        echo -e "${CYAN}📥 Step 1/4: Listing files from Google Drive with gdrive CLI...${RESET}"
+        GDRIVE_LIST_OUTPUT=$("$GDRIVE_BIN" list --no-header --query "'$GDRIVE_FOLDER_ID' in parents" --name-width 0 | grep '.jam' | awk '{print $1, $NF}')
+        if [[ -z "$GDRIVE_LIST_OUTPUT" ]]; then
+          echo -e "${RED}❌ Could not list files from Google Drive using gdrive CLI. Falling back to scraping method.${RESET}"
+          use_gdrive_cli=0
+        fi
+      fi
+
+      if [[ "$use_gdrive_cli" == "1" ]]; then
+        LATEST_FILE_ID=$(echo "$GDRIVE_LIST_OUTPUT" | awk '{gsub(".jam","",$2); print $1, $2}' | sort -k2 -n | tail -n 1 | awk '{print $1}')
+        LATEST_FILE_NAME=$(echo "$GDRIVE_LIST_OUTPUT" | awk '{gsub(".jam","",$2); print $1, $2}' | sort -k2 -n | tail -n 1 | awk '{print $2 ".jam"}')
+        LATEST_BLOCK=$(echo "$LATEST_FILE_NAME" | grep -oE '[0-9]+')
+
+        echo ""
+        echo -e "${CYAN}📥 Step 2/4: Downloading $LATEST_FILE_NAME (block $LATEST_BLOCK) using gdrive...${RESET}"
+        "$GDRIVE_BIN" download "$LATEST_FILE_ID" --path "$TMP_CLONE" --force
+        if [[ ! -f "$TMP_CLONE/$LATEST_FILE_NAME" ]]; then
+          echo -e "${RED}❌ Download failed via gdrive. Exiting.${RESET}"
+          rm -rf "$TMP_CLONE"
+          read -n 1 -s
+          continue
+        fi
+        mv "$TMP_CLONE/$LATEST_FILE_NAME" "$TMP_CLONE/state.jam"
+        echo ""
+        echo -e "${CYAN}📦 Step 3/4: Moving state.jam to ~/nockchain and cleaning up...${RESET}"
+        mv "$TMP_CLONE/state.jam" "$HOME/nockchain/state.jam"
+        rm -rf "$TMP_CLONE"
+        echo -e "${GREEN}✅ state.jam downloaded and saved to ${CYAN}$HOME/nockchain/state.jam${GREEN}.${RESET}"
+        read -n 1 -s -r -p $'\nPress any key to return to the main menu...'
+        continue
+      fi
+
+      # Fallback: Scrape Google Drive folder page and use gdown
+      echo ""
+      echo -e "${CYAN}📥 Step 2/4: Creating temp folder and scraping Google Drive folder page...${RESET}"
+      # Install wget and gdown if needed
+      if ! command -v wget &>/dev/null; then
+        echo -e "${YELLOW}wget not found. Installing...${RESET}"
+        sudo apt-get update && sudo apt-get install -y wget
+      fi
+      if ! command -v gdown &>/dev/null; then
+        echo -e "${YELLOW}gdown not found. Installing via pip...${RESET}"
+        if ! command -v pip3 &>/dev/null; then
+          sudo apt-get update && sudo apt-get install -y python3-pip
+        fi
+        pip3 install --user gdown
+        export PATH="$HOME/.local/bin:$PATH"
+      fi
+
+      # --- BEGIN PATCH: Improved fallback Google Drive scraping logic ---
+      # 📥 Step 1/4: Download the folder page with a proper User-Agent
+      FOLDER_URL="https://drive.google.com/drive/folders/1aEYZwmg4isTuYXWFn9gKPl92-pYndwUw"
+      mkdir -p "$TMP_CLONE"
+      wget -qO "$TMP_CLONE/folder.html" --header="User-Agent: Mozilla/5.0" "$FOLDER_URL"
+      # Wait for folder.html to exist and be non-empty, up to 2.5 seconds
+      for i in {1..5}; do
+        [[ -s "$TMP_CLONE/folder.html" ]] && break
+        sleep 0.5
+      done
+      if [[ ! -s "$TMP_CLONE/folder.html" ]]; then
+        echo -e "${RED}❌ Failed to download or save folder.html properly.${RESET}"
+        rm -rf "$TMP_CLONE"
+        read -n 1 -s
+        continue
+      fi
+
+      # 📥 Step 2/4: Diagnostic extraction of .jam files and their IDs using Python+BeautifulSoup for robust parsing
+      echo -e "${DIM}Parsing folder.html for .jam entries (Python+BeautifulSoup)...${RESET}"
+      pip3 install -q beautifulsoup4
+      python3 - <<EOF
+import os
+from bs4 import BeautifulSoup
+
+tmp_clone = os.environ.get("TMP_CLONE", os.path.expanduser("~/nockchain/tmp_drive_download"))
+with open(f"{tmp_clone}/folder.html") as f:
+    soup = BeautifulSoup(f, "html.parser")
+
+ids = []
+jams = []
+for div in soup.find_all("div"):
+    if div.has_attr("data-id") and div["data-id"] != "_gd":
+        ids.append(div["data-id"])
+    if div.has_attr("data-tooltip") and "Binary:" in div["data-tooltip"] and ".jam" in div["data-tooltip"]:
+        name = div["data-tooltip"].split("Binary:")[-1].strip()
+        if name.endswith(".jam"):
+            jams.append(name)
+
+pairs = list(zip(ids, jams))
+
+with open(f"{tmp_clone}/jam_files.txt", "w") as out:
+    for id_, name in pairs:
+        out.write(f"{id_}\t{name}\n")
+EOF
+      if [[ ! -s "$TMP_CLONE/jam_files.txt" ]]; then
+        echo -e "${RED}❌ Could not extract any .jam files from folder.html.${RESET}"
+        read -n 1 -s
+        continue
+      fi
+      echo -e "${DIM}Found $(wc -l < "$TMP_CLONE/jam_files.txt") .jam file(s).${RESET}"
+      echo -e "${DIM}Discovered .jam files with IDs:${RESET}"
+      while IFS=$'\t' read -r id name; do
+        # echo "[DEBUG] raw line: $id $name"
+        [[ -z "$id" || -z "$name" || "$name" != *.jam ]] && continue
+        block=$(echo "$name" | grep -oE '[0-9]+')
+        echo -e "${CYAN}- $name${RESET} ${DIM}(block $block, id=$id)${RESET}"
+      done < "$TMP_CLONE/jam_files.txt"
+      # Extract full metadata list and pick true latest based on numeric block
+      latest_block=-1
+      latest_id=""
+      latest_name=""
+      while IFS=$'\t' read -r id name; do
+        block=$(echo "$name" | grep -oE '[0-9]+')
+        [[ -z "$id" || -z "$name" || -z "$block" ]] && continue
+        if (( block > latest_block )); then
+          latest_block=$block
+          latest_id=$id
+          latest_name=$name
+        fi
+      done < "$TMP_CLONE/jam_files.txt"
+      # echo "[DEBUG] selected latest_name='$latest_name', latest_block='$latest_block', latest_id='$latest_id'"
+      if [[ -z "$latest_id" || -z "$latest_name" || "$latest_block" -lt 0 ]]; then
+        echo -e "${RED}❌ Could not extract latest .jam file correctly. Aborting.${RESET}"
+        rm -rf "$TMP_CLONE"
+        read -n 1 -s
+        continue
+      fi
+      echo -e "${DIM}Selected latest .jam file: ${CYAN}$latest_name${DIM} (ID: $latest_id, Block: $latest_block)${RESET}"
+      echo ""
+      echo -e "${CYAN}📥 Step 3/4: Downloading state.jam (block $latest_block) using gdown...${RESET}"
+      gdown --id "$latest_id" -O "$TMP_CLONE/state.jam"
+      if [[ ! -f "$TMP_CLONE/state.jam" ]]; then
+        echo -e "${RED}❌ Download failed via gdown. Exiting.${RESET}"
+        rm -rf "$TMP_CLONE"
+        read -n 1 -s
+        continue
+      fi
+      echo ""
+      echo -e "${CYAN}📦 Step 4/4: Moving state.jam to ~/nockchain and cleaning up...${RESET}"
+      mv "$TMP_CLONE/state.jam" "$HOME/nockchain/state.jam"
+      rm -rf "$TMP_CLONE"
+      echo -e "${GREEN}✅ state.jam downloaded and saved to ${CYAN}$HOME/nockchain/state.jam${GREEN} (block $latest_block).${RESET}"
+      read -n 1 -s -r -p $'\nPress any key to return to the main menu...'
+      continue
+    fi
 
     if [[ "$selected" == *"Download latest state.jam from GitHub"* ]]; then
       echo -e "${CYAN}📥 Step 1/3: Create temp folder, Initializing Git and GIT LFS...${RESET}"
