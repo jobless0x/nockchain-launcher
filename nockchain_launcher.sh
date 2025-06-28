@@ -8,6 +8,16 @@ BOLD_BLUE="\e[1;34m"
 DIM="\e[2m"
 RESET="\e[0m"
 
+# Block normalization helper
+normalize_block() {
+  local block="$1"
+  if [[ "$block" =~ ^[0-9]{1,3}(\.[0-9]{3})*$ ]]; then
+    echo "$block" | tr -d '.'
+  else
+    echo ""
+  fi
+}
+
 # Helper: Ensure fzf is installed
 ensure_fzf_installed() {
   if ! command -v fzf &> /dev/null; then
@@ -135,8 +145,8 @@ for miner_dir in "$HOME/nockchain"/miner*; do
   [[ -d "$miner_dir" ]] || continue
   log_file="$miner_dir/$(basename "$miner_dir").log"
   if [[ -f "$log_file" && -r "$log_file" ]]; then
-    heard_block=$(grep -a 'heard block' "$log_file" | tail -n 5 | grep -oP 'height\s+\K[0-9]+\.[0-9]+' || true)
-    validated_block=$(grep -a 'added to validated blocks at' "$log_file" | tail -n 5 | grep -oP 'at\s+\K[0-9]+\.[0-9]+' || true)
+    heard_block=$(grep -a 'heard block' "$log_file" | tail -n 5 | grep -oP 'height\s+\K([0-9]{1,3}(?:\.[0-9]{3})*)' || true)
+    validated_block=$(grep -a 'added to validated blocks at' "$log_file" | tail -n 5 | grep -oP 'at\s+\K([0-9]{1,3}(?:\.[0-9]{3})*)' || true)
     combined=$(printf "%s\n%s\n" "$heard_block" "$validated_block" | sort -V | tail -n 1)
     [[ -n "$combined" ]] && all_blocks+=("$combined")
   fi
@@ -294,6 +304,15 @@ case "$USER_CHOICE" in
 # Finds the miner with the highest block and safely exports a fresh state.jam
 set -euo pipefail
 
+normalize_block() {
+  local block="$1"
+  if [[ "$block" =~ ^[0-9]{1,3}(\.[0-9]{3})*$ ]]; then
+    echo "$block" | tr -d '.'
+  else
+    echo ""
+  fi
+}
+
 SRC=""
 HIGHEST=0
 HIGHEST_BLOCK=""
@@ -302,9 +321,9 @@ for d in "$HOME/nockchain"/miner*; do
   [[ -d "$d" ]] || continue
   log="$d/$(basename "$d").log"
   if [[ -f "$log" ]]; then
-    blk=$(grep -a 'added to validated blocks at' "$log" 2>/dev/null | tail -n 1 | grep -oP 'at\s+\K[0-9]+\.[0-9]+')
-    if [[ "$blk" =~ ^([0-9]+)\.([0-9]+)$ ]]; then
-      num=$((10#${BASH_REMATCH[1]} * 1000 + 10#${BASH_REMATCH[2]}))
+    blk=$(grep -a 'added to validated blocks at' "$log" 2>/dev/null | tail -n 1 | grep -oP 'at\s+\K([0-9]{1,3}(?:\.[0-9]{3})*)')
+    if [[ -n "$blk" ]]; then
+      num=$(normalize_block "$blk")
       if (( num > HIGHEST )); then
         HIGHEST=$num
         HIGHEST_BLOCK=$blk
@@ -339,7 +358,8 @@ echo "[$(date)] 🧹 Cleaning up temporary folder..." >> "$HOME/nockchain/statej
 echo "[INFO] Cleaning up temporary folder $TMP..."
 rm -rf "$TMP"
 
-echo "[$(date)] ✅ Exported fresh state.jam from block $HIGHEST_BLOCK to $OUT" | tee -a "$HOME/nockchain/statejam_backup.log"
+echo "[$(date)] ✅ Exported fresh state.jam from block $HIGHEST_BLOCK to $OUT" >> "$HOME/nockchain/statejam_backup.log"
+echo "✅ Backup script executed successfully."
 EOS
       chmod +x "$BACKUP_SCRIPT"
       if [[ ! -x "$BACKUP_SCRIPT" ]]; then
@@ -398,7 +418,7 @@ EOS
       for d in "$HOME/nockchain"/miner*; do
         [[ -d "$d" ]] || continue
         log="$d/$(basename "$d").log"
-        blk=$(grep -a 'added to validated blocks at' "$log" 2>/dev/null | tail -n 1 | grep -oP 'at\s+\K[0-9]+\.[0-9]+')
+        blk=$(grep -a 'added to validated blocks at' "$log" 2>/dev/null | tail -n 1 | grep -oP 'at\s+\K([0-9]{1,3}(?:\.[0-9]{3})*)')
         if [[ -n "$blk" ]]; then
           echo -e "${GREEN}🟢 Detected ${CYAN}$(basename "$d")${RESET} at block ${BOLD_BLUE}$blk${RESET}"
           miner_logs+=("$blk $d")
@@ -421,8 +441,6 @@ EOS
       sleep 1
       kill $TAIL_PID
       echo -e ""
-      echo -e "${GREEN}✅ Backup script executed successfully.${RESET}"
-      echo ""
       echo -e "${YELLOW}Press any key to return to the main menu...${RESET}"
       read -n 1 -s
     }
@@ -561,7 +579,7 @@ except Exception as e:
       miner_name="miner${miner_id}"
       latest_block="--"
       if [[ -f "$log_path" ]]; then
-        latest_block=$(grep -a 'added to validated blocks at' "$log_path" 2>/dev/null | tail -n 1 | grep -oP 'at\s+\K[0-9]+\.[0-9]+' || echo "--")
+        latest_block=$(grep -a 'added to validated blocks at' "$log_path" 2>/dev/null | tail -n 1 | grep -oP 'at\s+\K([0-9]{1,3}(?:\.[0-9]{3})*)' || echo "--")
       fi
       # Determine systemd status for this miner
       if systemctl is-active --quiet "nockchain-${miner_name}"; then
@@ -1827,8 +1845,8 @@ EOS
         log_file="$miner_dir/$(basename "$miner_dir").log"
         height=""
         if [[ -f "$log_file" && -r "$log_file" ]]; then
-          heard_block=$(grep -a 'heard block' "$log_file" | tail -n 5 | grep -oP 'height\s+\K[0-9]+\.[0-9]+' || true)
-          validated_block=$(grep -a 'added to validated blocks at' "$log_file" | tail -n 5 | grep -oP 'at\s+\K[0-9]+\.[0-9]+' || true)
+          heard_block=$(grep -a 'heard block' "$log_file" | tail -n 5 | grep -oP 'height\s+\K([0-9]{1,3}(?:\.[0-9]{3})*)' || true)
+          validated_block=$(grep -a 'added to validated blocks at' "$log_file" | tail -n 5 | grep -oP 'at\s+\K([0-9]{1,3}(?:\.[0-9]{3})*)' || true)
           combined=$(printf "%s\n%s\n" "$heard_block" "$validated_block" | sort -V | tail -n 1)
           if [[ -n "$combined" ]]; then
             all_blocks+=("$combined")
@@ -1930,7 +1948,7 @@ EOS
           fi
 
           if [[ -f "$log_file" ]]; then
-            latest_block=$(grep -a 'added to validated blocks at' "$log_file" 2>/dev/null | tail -n 1 | grep -oP 'at\s+\K[0-9]+\.[0-9]+' || echo "--")
+            latest_block=$(grep -a 'added to validated blocks at' "$log_file" 2>/dev/null | tail -n 1 | grep -oP 'at\s+\K([0-9]{1,3}(?:\.[0-9]{3})*)' || echo "--")
           else
             latest_block="--"
           fi
