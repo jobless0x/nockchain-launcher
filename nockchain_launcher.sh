@@ -346,7 +346,15 @@ for d in "$HOME/nockchain"/miner[0-9]*; do
   [[ -z "$miner_name" ]] && continue
   log="$d/$miner_name.log"
   if [[ -f "$log" ]]; then
-    blk=$(grep -a 'added to validated blocks at' "$log" 2>/dev/null | tail -n 1 | grep -oP 'at\s+\K([0-9]{1,3}(?:\.[0-9]{3})*)')
+    raw_line=$(grep -a 'added to validated blocks at' "$log" 2>/dev/null | tail -n 1 || true)
+    blk=$(echo "$raw_line" | grep -oP 'at\s+\K([0-9]{1,3}(?:\.[0-9]{3})*)' || true)
+    # --- BEGIN logging block per miner ---
+    if [[ -n "$blk" ]]; then
+      echo -e "🟢 Detected $(basename "$d") at block $blk"
+    else
+      echo -e "⚠️ No valid block found in $(basename "$d")"
+    fi
+    # --- END logging block per miner ---
     if [[ -n "$blk" ]]; then
       num=$(normalize_block "$blk")
       if (( num > HIGHEST )); then
@@ -359,32 +367,34 @@ for d in "$HOME/nockchain"/miner[0-9]*; do
 done
 
 if [[ -z "$SRC" ]]; then
-  echo "[$(date)] ❌ No suitable miner folder found." >> "$HOME/nockchain/statejam_backup.log"
+  echo "[$(date)] ❌ No suitable miner folder found."
   exit 1
 fi
 
-# Log the highest block/miner found
-echo "[$(date)] 🔍 Found miner with highest block: $HIGHEST_BLOCK at $SRC" >> "$HOME/nockchain/statejam_backup.log"
-echo "[INFO] Exporting from miner at $SRC (block $HIGHEST_BLOCK)..."
-
 TMP="$HOME/nockchain/miner-export"
 OUT="$HOME/nockchain/state.jam"
-echo "[$(date)] 📁 Creating temporary clone at $TMP" >> "$HOME/nockchain/statejam_backup.log"
-echo "[INFO] Creating temporary copy of miner folder at $TMP..."
+
+# Styled user output
+GREEN="\e[32m"
+CYAN="\e[36m"
+BOLD_BLUE="\e[1;34m"
+DIM="\e[2m"
+RESET="\e[0m"
+
+echo -e "${DIM}🔍 Found miner with highest block:${RESET} ${CYAN}$(basename "$SRC")${RESET} at block ${BOLD_BLUE}$HIGHEST_BLOCK${RESET}"
+echo -e "${DIM}📁 Creating temporary clone at:${RESET} ${CYAN}$TMP${RESET}"
 rm -rf "$TMP"
 cp -a "$SRC" "$TMP"
 
 cd "$TMP"
-echo "[$(date)] 🧠 Running export-state-jam command..." >> "$HOME/nockchain/statejam_backup.log"
-echo "[INFO] Running nockchain --export-state-jam to $OUT..."
-"$HOME/nockchain/target/release/nockchain" --export-state-jam "$OUT" >> "$HOME/nockchain/statejam_backup.log" 2>&1
+echo -e "${DIM}🧠 Running export-state-jam command...${RESET}"
+"$HOME/nockchain/target/release/nockchain" --export-state-jam "$OUT"
 cd "$HOME/nockchain"
-echo "[$(date)] 🧹 Cleaning up temporary folder..." >> "$HOME/nockchain/statejam_backup.log"
-echo "[INFO] Cleaning up temporary folder $TMP..."
+echo -e "${DIM}🧹 Cleaning up temporary folder...${RESET}"
 rm -rf "$TMP"
 
-echo "[$(date)] ✅ Exported fresh state.jam from block $HIGHEST_BLOCK to $OUT" >> "$HOME/nockchain/statejam_backup.log"
-echo "✅ Backup script executed successfully."
+echo -e "${GREEN}✅ Exported state.jam from block ${BOLD_BLUE}$HIGHEST_BLOCK${GREEN} to ${CYAN}$OUT${RESET}"
+
 EOS
       chmod +x "$BACKUP_SCRIPT"
       if [[ ! -x "$BACKUP_SCRIPT" ]]; then
@@ -437,37 +447,9 @@ EOS
       rm -f "$HOME/nockchain/statejam_backup.log"
       touch "$HOME/nockchain/statejam_backup.log"
 
-      # --- BEGIN: Show miner block heights before backup ---
-      echo -e "${DIM}Detecting highest block from available miners...${RESET}"
-      miner_logs=()
-      for d in "$HOME/nockchain"/miner[0-9]*; do
-        [[ -d "$d" ]] || continue
-        miner_name=$(basename "$d" | sed -nE 's/^(miner[0-9]+)$/\1/p')
-        [[ -z "$miner_name" ]] && continue
-        log="$d/$miner_name.log"
-        blk=$(grep -a 'added to validated blocks at' "$log" 2>/dev/null | tail -n 1 | grep -oP 'at\s+\K([0-9]{1,3}(?:\.[0-9]{3})*)')
-        if [[ -n "$blk" ]]; then
-          echo -e "${GREEN}🟢 Detected ${CYAN}$(basename "$d")${RESET} at block ${BOLD_BLUE}$blk${RESET}"
-          miner_logs+=("$blk $d")
-        fi
-      done
-      if [[ ${#miner_logs[@]} -gt 0 ]]; then
-        highest=$(printf "%s\n" "${miner_logs[@]}" | sort -nr | head -n1)
-        blk=$(echo "$highest" | awk '{print $1}')
-        dir=$(echo "$highest" | cut -d' ' -f2-)
-        echo -e "${GREEN}✅ Backing up from ${CYAN}$(basename "$dir")${RESET} at block ${BOLD_BLUE}$blk${RESET}"
-      else
-        echo -e "${RED}❌ No miner logs found with validated blocks.${RESET}"
-      fi
-      echo ""
-      # --- END: Show miner block heights before backup ---
-
-      tail -f "$HOME/nockchain/statejam_backup.log" &
-      TAIL_PID=$!
-      bash "$BACKUP_SCRIPT"
-      sleep 1
-      kill $TAIL_PID
       echo -e ""
+      "$BACKUP_SCRIPT" 2>&1 | tee -a "$HOME/nockchain/statejam_backup.log"
+      echo ""
       echo -e "${YELLOW}Press any key to return to the main menu...${RESET}"
       read -n 1 -s
     }
@@ -586,11 +568,9 @@ except Exception as e:
     declare -A miner_dirs_map
     declare -A miner_blocks_map
 
-    # Fetch latest commit message that modified state.jam
-    GITHUB_COMMIT_MSG=$(curl -fsSL "https://api.github.com/repos/jobless0x/nockchain-launcher/commits?path=state.jam" |
-      grep -m 1 '"message":' |
-      grep -oE 'block [0-9]+\.[0-9]+' |
-      head -n 1)
+    # Fetch latest commit message that modified state.jam (uses jq and grep for block version)
+    GITHUB_COMMIT_MSG=$(curl -fsSL "https://api.github.com/repos/jobless0x/nockchain-launcher/commits?path=state.jam" 2>/dev/null |
+      jq -r '.[0].commit.message' | grep -oE 'block [0-9]+\.[0-9]+')
 
     if [[ "$GITHUB_COMMIT_MSG" =~ block[[:space:]]+([0-9]+\.[0-9]+) ]]; then
       BLOCK_COMMIT_VERSION="${BASH_REMATCH[1]}"
@@ -832,10 +812,25 @@ EOF
       if command -v pv &>/dev/null; then
         echo -e "${CYAN}🔄 Downloading state.jam via Git LFS...${RESET}"
         git lfs pull --include="state.jam" 2>&1 | grep --line-buffered -v 'Downloading LFS objects:' | pv -lep -s 1100000000 -N "state.jam" >/dev/null
+        # Check LFS pull exit code
+        if [[ $? -ne 0 ]]; then
+          echo -e "${RED}❌ Failed to download state.jam from GitHub. LFS quota likely exceeded.${RESET}"
+          echo -e "${YELLOW}You can try downloading from Google Drive instead (option 5 > Google Drive).${RESET}"
+          echo -e "${CYAN}Press Enter to return to the main menu...${RESET}"
+          read
+          continue
+        fi
         echo -e "${GREEN}✅ Download complete.${RESET}"
       else
         echo -e "${CYAN}🔄 Downloading state.jam...${RESET}"
         git lfs pull --include="state.jam"
+        if [[ $? -ne 0 ]]; then
+          echo -e "${RED}❌ Failed to download state.jam from GitHub. LFS quota likely exceeded.${RESET}"
+          echo -e "${YELLOW}You can try downloading from Google Drive instead (option 5 > Google Drive).${RESET}"
+          echo -e "${CYAN}Press Enter to return to the main menu...${RESET}"
+          read
+          continue
+        fi
         echo -e "${GREEN}✅ Download complete.${RESET}"
       fi
       trap - INT
@@ -1029,16 +1024,25 @@ EOF
       sudo apt-get update && sudo apt-get upgrade -y
       sudo apt install -y curl iptables build-essential ufw screen git wget lz4 jq make gcc nano automake autoconf tmux htop nvme-cli libgbm1 pkg-config libssl-dev libleveldb-dev tar clang bsdmainutils ncdu unzip libclang-dev llvm-dev
 
-      if ! command -v cargo &>/dev/null; then
-        echo -e "${CYAN}>> Installing Rust...${RESET}"
-        curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+      if [[ ! -f "$HOME/.cargo/env" ]]; then
+        echo -e "${YELLOW}⚠️  .cargo/env missing. Installing Rust using rustup...${RESET}"
+        if ! curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y; then
+          echo -e "${RED}❌ Rust installation failed. Aborting.${RESET}"
+          exit 1
+        fi
+      fi
+
+      if [[ -f "$HOME/.cargo/env" ]]; then
         source "$HOME/.cargo/env"
+      else
+        echo -e "${RED}❌ Rust environment setup failed. Aborting.${RESET}"
+        exit 1
       fi
 
       echo -e "${CYAN}>> Cloning Nockchain repo and starting build...${RESET}"
-      rm -rf nockchain .nockapp
-      git clone https://github.com/zorp-corp/nockchain
-      cd nockchain
+      rm -rf "$HOME/nockchain" "$HOME/.nockapp"
+      git clone https://github.com/zorp-corp/nockchain "$HOME/nockchain"
+      cd "$HOME/nockchain"
       cp .env_example .env
 
       if screen -ls | grep -q "nockbuild"; then
@@ -1047,7 +1051,7 @@ EOF
       fi
 
       echo -e "${CYAN}>> Launching build in screen session 'nockbuild' and logging to build.log...${RESET}"
-      screen -dmS nockbuild bash -c "cd \$HOME/nockchain && make install-hoonc && make build && make install-nockchain-wallet && make install-nockchain | tee build.log"
+      screen -dmS nockbuild bash -c "cd \$HOME/nockchain && { make install-hoonc && make build && make install-nockchain-wallet && make install-nockchain; } 2>&1 | tee \$HOME/nockchain/build.log"
 
       echo -e "${GREEN}>> Build started in screen session 'nockbuild'.${RESET}"
       echo -e "${YELLOW}>> To monitor build: ${DIM}screen -r nockbuild${RESET}"
