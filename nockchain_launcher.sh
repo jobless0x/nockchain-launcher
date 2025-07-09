@@ -688,7 +688,7 @@ EOF
 
   # Define important paths for binaries and logs
   BINARY_PATH="$NOCKCHAIN_BIN"
-  LOG_PATH="$NOCKCHAIN_HOME/build.log"
+  LOG_PATH="$NOCKCHAIN_HOME/nockbuild.log"
 
   if [[ -z "$USER_CHOICE" ]]; then
     echo -e "${CYAN}Exiting launcher. Goodbye!${RESET}"
@@ -1507,7 +1507,17 @@ EOF
       safe_kill_screen "nockbuild"
 
       echo -e "${CYAN}>> Launching build in screen session 'nockbuild' and logging to build.log...${RESET}"
-      screen -dmS nockbuild bash -c "cd \$NOCKCHAIN_HOME && { make install-hoonc && make build && make install-nockchain-wallet && make install-nockchain; } 2>&1 | tee \$NOCKCHAIN_HOME/build.log"
+      screen -dmS nockbuild bash -c "
+        source \"$SETTINGS_FILE\";
+        cd \$NOCKCHAIN_HOME && {
+          make install-hoonc && \
+          make build && \
+          make install-nockchain-wallet && \
+          make install-nockchain && \
+        echo 'nockchain install completed.'
+        } 2>&1 | tee \$NOCKCHAIN_HOME/nockbuild.log
+        exec bash
+      "
 
       echo -e "${GREEN}>> Build started in screen session 'nockbuild'.${RESET}"
       echo -e "${YELLOW}>> To monitor build: ${DIM}screen -r nockbuild${RESET}"
@@ -1544,19 +1554,21 @@ EOF
     MINING_KEY_DISPLAY=$(grep "^MINING_PUBKEY=" "$NOCKCHAIN_HOME/.env" | cut -d= -f2)
     echo -e "${CYAN}>> Launching update and miner restart in screen session 'nockupdate'...${RESET}"
     screen -dmS nockupdate bash -c "
-      cd \$NOCKCHAIN_HOME && \
-      git reset --hard HEAD && \
-      git pull && \
-      make install-nockchain && \
-      export PATH=\"\$HOME/.cargo/bin:\$PATH\" && \
-      if tmux ls 2>/dev/null | grep -q '^miner'; then
-        echo '>> Killing tmux miner sessions...'
-        tmux ls 2>/dev/null | grep '^miner' | cut -d: -f1 | xargs -r -n1 tmux kill-session -t
-      fi && \
-      for d in \$NOCKCHAIN_HOME/miner*; do
-        bash \"$NOCKCHAIN_HOME_launcher.sh\" --restart-miner \"\$d\" \"$MINING_KEY_DISPLAY\"
-      done
-      echo 'Update and restart complete.'
+      source \"$SETTINGS_FILE\";
+      cd \$NOCKCHAIN_HOME && {
+        git reset --hard HEAD && \
+        git pull && \
+        make install-nockchain && \
+        export PATH=\"\$HOME/.cargo/bin:\$PATH\" && \
+        if tmux ls 2>/dev/null | grep -q '^miner'; then
+          echo '>> Killing tmux miner sessions...'
+          tmux ls 2>/dev/null | grep '^miner' | cut -d: -f1 | xargs -r -n1 tmux kill-session -t
+        fi
+        for d in \$NOCKCHAIN_HOME/miner*; do
+          bash \"$SCRIPT_PATH\" --restart-miner \"\$d\" \"\$MINING_KEY_DISPLAY\"
+        done
+        echo 'Update and restart completed.'
+      } 2>&1 | tee \$NOCKCHAIN_HOME/nockupdate.log
       exec bash
     "
     echo ""
@@ -1596,11 +1608,13 @@ EOF
 
     echo -e "${CYAN}>> Launching wallet update in screen session 'walletupdate'...${RESET}"
     screen -dmS walletupdate bash -c "
-      cd \$NOCKCHAIN_HOME && \
-      git pull && \
-      make install-nockchain-wallet && \
-      export PATH=\"\$HOME/.cargo/bin:\$PATH\" && \
-      echo 'Wallet update complete.' && \
+      source \"$SETTINGS_FILE\";
+      cd \$NOCKCHAIN_HOME && {
+        git pull && \
+        make install-nockchain-wallet && \
+        export PATH=\"\$HOME/.cargo/bin:\$PATH\" && \
+        echo 'Wallet update completed.'
+      } 2>&1 | tee \$NOCKCHAIN_HOME/walletupdate.log
       exec bash
     "
     echo -e "${GREEN}✅ Wallet update started in screen session 'walletupdate'.${RESET}"
