@@ -117,15 +117,31 @@ You can safely edit this file to customize peers, ports, and state behavior.
 
 ---
 
+## Editing Launcher Settings
+
+You can change the core launcher settings at any time (user, install directory, or binary path):
+
+- Select **Option 23** from the main menu ("Edit launcher settings")
+- Choose which setting to edit:  
+  - `NOCKCHAIN_USER`: which Linux user runs miners  
+  - `NOCKCHAIN_HOME`: install/data directory  
+  - `NOCKCHAIN_BIN`: path to your Nockchain binary
+- The launcher shows the current value for each.  
+- Press **Enter** to keep the current value, or type a new one to change.
+
+Changes are saved instantly to `~/.nockchain_launcher.conf` and used next run.
+
+---
+
 ## Useful Paths
 
-| Purpose           | Path                                  |
-|-------------------|----------------------------------------|
-| Launcher Script   | `~/nockchain_launcher.sh`             |
-| Miner Logs        | `~/nockchain/minerX/minerX.log`       |
-| Config File       | `~/launch.cfg`                        |
-| State Export      | `~/nockchain/state.jam`               |
-| Build Logs        | `~/nockchain/build.log`               |
+| Purpose           | Path                             |
+|-------------------|----------------------------------|
+| Miners            | ~/nockchain/minerX/              |
+| Miner logs        | ~/nockchain/minerX/minerX.log    |
+| Config            | ~/launch.cfg                     |
+| State Export      | ~/nockchain/state.jam            |
+| Settings          | ~/.nockchain_launcher.conf       |
 
 ---
 
