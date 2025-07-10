@@ -1,4 +1,18 @@
 #!/bin/bash
+SCRIPT_PATH="$(realpath "$0")"
+SCRIPT_DIR="$(cd "$(dirname "$SCRIPT_PATH")" && pwd)"
+LAUNCH_CFG="$SCRIPT_DIR/launch.cfg"
+
+# LAUNCHER_VERSION and REMOTE_VERSION
+LAUNCHER_VERSION_FILE="$(dirname "$SCRIPT_PATH")/NOCKCHAIN_LAUNCHER_VERSION"
+if [[ -f "$LAUNCHER_VERSION_FILE" ]]; then
+  LAUNCHER_VERSION=$(cat "$LAUNCHER_VERSION_FILE" | tr -d '[:space:]')
+else
+  LAUNCHER_VERSION="(unknown)"
+fi
+# Fetch remote version directly
+REMOTE_VERSION=$(curl -fsSL https://raw.githubusercontent.com/jobless0x/nockchain-launcher/main/NOCKCHAIN_LAUNCHER_VERSION 2>/dev/null | tr -d '[:space:]')
+REMOTE_VERSION=${REMOTE_VERSION:-"(offline)"}
 
 GREEN="\e[32m"
 RED="\e[31m"
@@ -149,7 +163,7 @@ generate_systemd_service() {
         print
         exit
       }
-    ' "$CONFIG_FILE" | tr -d '\000')
+    ' "$LAUNCH_CFG" | tr -d '\000')
   local abs_dir="$NOCKCHAIN_HOME/miner$miner_id"
   local abs_script="$(realpath "$SCRIPT_DIR/run_miner.sh")"
   local actual_user
@@ -510,21 +524,44 @@ get_latest_statejam_block() {
   echo "$block|$mins"
 }
 
-NCK_DIR="$NOCKCHAIN_HOME"
-NCK_BIN="$NOCKCHAIN_BIN"
+get_total_cpu_usage() {
+  top -bn1 | grep "Cpu(s)" | tail -n 1 | awk '{print 100 - $8}' | xargs printf "%.1f"
+}
 
-SCRIPT_PATH="$(realpath "$0")"
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-CONFIG_FILE="$SCRIPT_DIR/launch.cfg"
-LAUNCHER_VERSION_FILE="$(dirname "$SCRIPT_PATH")/NOCKCHAIN_LAUNCHER_VERSION"
-if [[ -f "$LAUNCHER_VERSION_FILE" ]]; then
-  LAUNCHER_VERSION=$(cat "$LAUNCHER_VERSION_FILE" | tr -d '[:space:]')
-else
-  LAUNCHER_VERSION="(unknown)"
-fi
-# Fetch remote version directly, do not overwrite local version file except during update
-REMOTE_VERSION=$(curl -fsSL https://raw.githubusercontent.com/jobless0x/nockchain-launcher/main/NOCKCHAIN_LAUNCHER_VERSION 2>/dev/null | tr -d '[:space:]')
-REMOTE_VERSION=${REMOTE_VERSION:-"(offline)"}
+get_total_mem_usage() {
+  local mem_line
+  mem_line=$(free -g | awk '/^Mem:/ {print $3, $2}')
+  local used=$(echo "$mem_line" | awk '{print $1}')
+  local total=$(echo "$mem_line" | awk '{print $2}')
+  if [[ "$total" -gt 0 ]]; then
+    local percent=$((100 * used / total))
+    echo "$percent $used $total"
+  else
+    echo "-- -- --"
+  fi
+}
+
+get_network_height() {
+  local NETWORK_HEIGHT="--"
+  local all_blocks=()
+  for miner_dir in "$NOCKCHAIN_HOME"/miner[0-9]*; do
+    [[ -d "$miner_dir" ]] || continue
+    miner_label=$(basename "$miner_dir" | sed -nE 's/^(miner[0-9]+)$/\1/p')
+    [[ -z "$miner_label" ]] && continue
+    log_file="$miner_dir/${miner_label}.log"
+
+    if [[ -f "$log_file" && -r "$log_file" ]]; then
+      heard_block=$(grep -a 'heard block' "$log_file" | tail -n 5 | grep -oP 'height\s+\K([0-9]{1,3}(?:\.[0-9]{3})*)' || true)
+      validated_block=$(grep -a 'added to validated blocks at' "$log_file" | tail -n 5 | grep -oP 'at\s+\K([0-9]{1,3}(?:\.[0-9]{3})*)' || true)
+      combined=$(printf "%s\n%s\n" "$heard_block" "$validated_block" | sort -V | tail -n 1)
+      [[ -n "$combined" ]] && all_blocks+=("$combined")
+    fi
+  done
+  if [[ ${#all_blocks[@]} -gt 0 ]]; then
+    NETWORK_HEIGHT=$(printf "%s\n" "${all_blocks[@]}" | sort -V | tail -n 1)
+  fi
+  echo "$NETWORK_HEIGHT"
+}
 
 #
 # Begin main launcher loop that displays the menu and handles user input
@@ -548,30 +585,10 @@ EOF
 
   echo -e "${YELLOW}:: Powered by Jobless ::${RESET}"
   echo -e "${DIM}Welcome to the Nockchain Node Manager.${RESET}"
-
-  # Extract network height from all miner logs (for dashboard)
-  NETWORK_HEIGHT="--"
-  all_blocks=()
-  for miner_dir in "$NOCKCHAIN_HOME"/miner[0-9]*; do
-    [[ -d "$miner_dir" ]] || continue
-    miner_label=$(basename "$miner_dir" | sed -nE 's/^(miner[0-9]+)$/\1/p')
-    [[ -z "$miner_label" ]] && continue
-    log_file="$miner_dir/${miner_label}.log"
-
-    if [[ -f "$log_file" && -r "$log_file" ]]; then
-      heard_block=$(grep -a 'heard block' "$log_file" | tail -n 5 | grep -oP 'height\s+\K([0-9]{1,3}(?:\.[0-9]{3})*)' || true)
-      validated_block=$(grep -a 'added to validated blocks at' "$log_file" | tail -n 5 | grep -oP 'at\s+\K([0-9]{1,3}(?:\.[0-9]{3})*)' || true)
-      combined=$(printf "%s\n%s\n" "$heard_block" "$validated_block" | sort -V | tail -n 1)
-      [[ -n "$combined" ]] && all_blocks+=("$combined")
-    fi
-  done
-  if [[ ${#all_blocks[@]} -gt 0 ]]; then
-    NETWORK_HEIGHT=$(printf "%s\n" "${all_blocks[@]}" | sort -V | tail -n 1)
-  fi
-
   echo -e "${DIM}Install, configure, and monitor multiple Nockchain miners with ease.${RESET}"
   echo ""
 
+  # Show running miners
   RUNNING_MINERS=0
   for i in $(find "$NOCKCHAIN_HOME" -maxdepth 1 -type d -name "miner[0-9]*" 2>/dev/null | sed -nE 's/^.*\/(miner[0-9]+)$/\1/p' | sed -nE 's/^miner([0-9]+)$/\1/p' | sort -n); do
     if [[ "$(check_service_status "nockchain-miner$i")" == "active" ]]; then
@@ -585,10 +602,38 @@ EOF
   fi
 
   if ((RUNNING_MINERS > 0)); then
-    echo -e "${GREEN}🟢 $RUNNING_MINERS active miners${RESET} ${DIM}($MINER_FOLDERS total miners)${RESET}"
+    MINER_EMOJI="🟢"
   else
-    echo -e "${RED}🔴 No miners running${RESET} ${DIM}($MINER_FOLDERS total miners)${RESET}"
+    MINER_EMOJI="🔴"
   fi
+  echo -e "${MINER_EMOJI}  ${CYAN}Active Miners:${RESET} ${YELLOW}${RUNNING_MINERS}${RESET}   ${DIM}(${MINER_FOLDERS} total miners)${RESET}"
+
+  # Show live system metrics: CPU load, memory usage, uptime
+  TOTAL_CPU=$(get_total_cpu_usage)
+  read TOTAL_MEM_PCT TOTAL_MEM_USED TOTAL_MEM_TOTAL < <(get_total_mem_usage)
+
+  # Choose emoji based on CPU usage
+  if (($(echo "$TOTAL_CPU < 60" | bc))); then
+    CPU_EMOJI="🟢"
+  elif (($(echo "$TOTAL_CPU < 90" | bc))); then
+    CPU_EMOJI="🟡"
+  else
+    CPU_EMOJI="🔴"
+  fi
+  # Choose emoji based on Mem usage
+  if [[ "$TOTAL_MEM_PCT" =~ ^[0-9]+$ ]]; then
+    if ((TOTAL_MEM_PCT < 60)); then
+      MEM_EMOJI="🟢"
+    elif ((TOTAL_MEM_PCT < 90)); then
+      MEM_EMOJI="🟡"
+    else
+      MEM_EMOJI="🔴"
+    fi
+  else
+    MEM_EMOJI="⚪"
+  fi
+
+  echo -e "${CPU_EMOJI}  ${CYAN}Total CPU Usage:${RESET} ${YELLOW}${TOTAL_CPU}%${RESET}   |   ${MEM_EMOJI}  ${CYAN}Total Mem:${RESET} ${YELLOW}${TOTAL_MEM_PCT}%${RESET} (${YELLOW}${TOTAL_MEM_USED}${RESET}/${YELLOW}${TOTAL_MEM_TOTAL}${RESET} GB)"
 
   # Show live state.jam status using new get_statejam_status
   output=$(get_latest_statejam_block | tr '|' ' ' 2>/dev/null || echo "-- --")
@@ -597,10 +642,17 @@ EOF
   min_disp="${latest_statejam_mins:---}"
 
   if systemctl is-active --quiet nockchain-statejam-backup.timer; then
-    echo -e "${GREEN}🟢 state.jam: block $blk_disp, next in ${min_disp}m${RESET}"
+    STATEJAM_EMOJI="🟢"
+    if [[ "$min_disp" == "running" ]]; then
+      STATEJAM_STATUS="${CYAN}state.jam:${RESET} ${YELLOW}block $blk_disp${RESET}, ${YELLOW}backup running${RESET}"
+    else
+      STATEJAM_STATUS="${CYAN}state.jam:${RESET} ${YELLOW}block $blk_disp${RESET}, next in ${YELLOW}${min_disp}m${RESET}"
+    fi
   else
-    echo -e "${RED}🔴 state.jam: backup inactive${RESET}"
+    STATEJAM_EMOJI="🔴"
+    STATEJAM_STATUS="${CYAN}state.jam:${RESET} ${RED}backup inactive${RESET}"
   fi
+  echo -e "${STATEJAM_EMOJI}  ${STATEJAM_STATUS}"
 
   # Display current version of node and launcher, and update status
   echo ""
@@ -629,10 +681,11 @@ EOF
     LAUNCHER_STATUS="${RED}🔴 Update available${RESET}"
   fi
 
-  # Always display version block (with improved alignment)
+  # Display version block
   printf "  ${CYAN}%-12s${RESET}%-18s %b\n" "Node:" "$VERSION" "$NODE_STATUS"
   printf "  ${CYAN}%-12s${RESET}%-18s %b\n" "Launcher:" "$LAUNCHER_VERSION" "$LAUNCHER_STATUS"
 
+  # Display PubKey
   if [[ -d "$NOCKCHAIN_HOME" ]]; then
     if [[ -f "$NOCKCHAIN_HOME/.env" ]]; then
       if grep -q "^MINING_PUBKEY=" "$NOCKCHAIN_HOME/.env"; then
@@ -647,17 +700,14 @@ EOF
   else
     printf "  ${CYAN}%-12s${RESET}%b\n" "Public Key:" "${YELLOW}(not available)${RESET}"
   fi
+
+  # Extract network height from all miner logs (for dashboard)
+  NETWORK_HEIGHT=$(get_network_height)
+
+  # Display height
   printf "  ${CYAN}%-12s${RESET}%-20s\n" "Height:" "$NETWORK_HEIGHT"
 
-  # Show live system metrics: CPU load, memory usage, uptime
-  CPU_LOAD=$(awk '{print $1}' /proc/loadavg)
-  RAM_USED=$(free -h | awk '/^Mem:/ {print $3}')
-  RAM_TOTAL=$(free -h | awk '/^Mem:/ {print $2}')
-  printf "  ${CYAN}%-12s${RESET}%-20s\n" "CPU Load:" "$CPU_LOAD / $(nproc)"
-  printf "  ${CYAN}%-12s${RESET}%-20s\n" "RAM Used:" "$RAM_USED / $RAM_TOTAL"
-  printf "  ${CYAN}%-12s${RESET}%-20s\n" "Uptime:" "$(uptime -p)"
-  # (Hourly backup service status now shown above with miner status)
-
+  # Display red line
   echo -e "\e[31m::════════════════════════════════════════════════════════\e[0m"
   echo ""
 
@@ -667,7 +717,7 @@ EOF
     "1) Install Nockchain from scratch" "21) Run system diagnostics" \
     "2) Update nockchain to latest version" "22) Monitor resource usage (htop)" \
     "3) Update nockchain-wallet only" "23) Edit launcher settings" \
-    "4) Update launcher script" "" \
+    "4) Update launcher script" "24) Clear logs (select which logs to delete)" \
     "5) Export or download state.jam file" "" \
     "6) Manage periodic state.jam backup" ""
 
@@ -696,297 +746,227 @@ EOF
   fi
 
   case "$USER_CHOICE" in
-  23)
+  # ===== Main Menu Option 1 =====
+  1)
     clear
-    while true; do
-      echo -e "${CYAN}Edit Launcher Settings${RESET}"
-      echo ""
-      echo -e "${YELLOW}Current settings:${RESET}"
-      echo -e "  NOCKCHAIN_USER: ${GREEN}$NOCKCHAIN_USER${RESET}"
-      echo -e "  NOCKCHAIN_HOME: ${GREEN}$NOCKCHAIN_HOME${RESET}"
-      echo -e "  NOCKCHAIN_BIN:  ${GREEN}$NOCKCHAIN_BIN${RESET}"
-      echo ""
-      menu_entries=(
-        "↩️  Cancel and return to main menu"
-        "Edit NOCKCHAIN_BIN   [current: $NOCKCHAIN_BIN]"
-        "Edit NOCKCHAIN_HOME  [current: $NOCKCHAIN_HOME]"
-        "Edit NOCKCHAIN_USER  [current: $NOCKCHAIN_USER]"
-      )
-      selected=$(printf "%s\n" "${menu_entries[@]}" | fzf --prompt="Select parameter to edit: " \
-        --pointer="👉" --color=prompt:blue,fg+:cyan,bg+:238,pointer:green,marker:green \
-        --header=$'\nUse ↑ ↓ arrows to select. ENTER to confirm.\n')
-      [[ -z "$selected" || "$selected" == "↩️  Cancel and return to main menu" ]] && break
 
-      if [[ "$selected" == *"NOCKCHAIN_USER"* ]]; then
-        read -rp "Enter new NOCKCHAIN_USER (current: $NOCKCHAIN_USER, press Enter to keep): " new_user
-        if [[ -n "$new_user" ]]; then
-          NOCKCHAIN_USER="$new_user"
-          echo -e "${GREEN}NOCKCHAIN_USER updated to '$NOCKCHAIN_USER'!${RESET}"
-        else
-          echo -e "${YELLOW}No change made.${RESET}"
-        fi
-      elif [[ "$selected" == *"NOCKCHAIN_HOME"* ]]; then
-        read -rp "Enter new NOCKCHAIN_HOME (current: $NOCKCHAIN_HOME, press Enter to keep): " new_home
-        if [[ -n "$new_home" ]]; then
-          NOCKCHAIN_HOME="$new_home"
-          echo -e "${GREEN}NOCKCHAIN_HOME updated to '$NOCKCHAIN_HOME'!${RESET}"
-        else
-          echo -e "${YELLOW}No change made.${RESET}"
-        fi
-      elif [[ "$selected" == *"NOCKCHAIN_BIN"* ]]; then
-        read -rp "Enter new NOCKCHAIN_BIN (current: $NOCKCHAIN_BIN, press Enter to keep): " new_bin
-        if [[ -n "$new_bin" ]]; then
-          NOCKCHAIN_BIN="$new_bin"
-          echo -e "${GREEN}NOCKCHAIN_BIN updated to '$NOCKCHAIN_BIN'!${RESET}"
-        else
-          echo -e "${YELLOW}No change made.${RESET}"
+    echo -e "${YELLOW}⚠️  This will install Nockchain from scratch. This may overwrite existing files.${RESET}"
+    confirm_yes_no "Are you sure you want to continue?" || {
+      echo -e "${CYAN}Returning to menu...${RESET}"
+      continue
+    }
+
+    # Handle sudo and root system preparation
+    if [ "$(id -u)" -eq 0 ]; then
+      echo -e "${YELLOW}>> Running as root. Updating system and installing sudo...${RESET}"
+      apt-get update && apt-get upgrade -y
+
+      if ! command -v sudo &>/dev/null; then
+        apt-get install sudo -y
+      fi
+    fi
+
+    if [ ! -f "$BINARY_PATH" ]; then
+      echo -e "${YELLOW}>> Nockchain not built yet. Starting Phase 1 (Build)...${RESET}"
+
+      echo -e "${CYAN}>> Installing system dependencies...${RESET}"
+      sudo apt-get update && sudo apt-get upgrade -y
+      sudo apt install -y curl iptables build-essential ufw screen git wget lz4 jq make gcc nano automake autoconf tmux htop nvme-cli libgbm1 pkg-config libssl-dev libleveldb-dev tar clang bsdmainutils ncdu unzip libclang-dev llvm-dev
+
+      if [[ ! -f "$HOME/.cargo/env" ]]; then
+        echo -e "${YELLOW}⚠️  .cargo/env missing. Installing Rust using rustup...${RESET}"
+        if ! curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y; then
+          echo -e "${RED}❌ Rust installation failed. Aborting.${RESET}"
+          exit 1
         fi
       fi
 
-      # Always update settings file after any change
-      cat >"$SETTINGS_FILE" <<EOF
-NOCKCHAIN_USER="$NOCKCHAIN_USER"
-NOCKCHAIN_HOME="$NOCKCHAIN_HOME"
-NOCKCHAIN_BIN="$NOCKCHAIN_BIN"
-EOF
-      source "$SETTINGS_FILE"
-      sleep 1
-      clear
-    done
+      if [[ -f "$HOME/.cargo/env" ]]; then
+        source "$HOME/.cargo/env"
+      else
+        echo -e "${RED}❌ Rust environment setup failed. Aborting.${RESET}"
+        exit 1
+      fi
+
+      echo -e "${CYAN}>> Cloning Nockchain repo and starting build...${RESET}"
+      rm -rf "$NOCKCHAIN_HOME" "$HOME/.nockapp"
+      git clone https://github.com/zorp-corp/nockchain "$NOCKCHAIN_HOME"
+      cd "$NOCKCHAIN_HOME"
+      cp .env_example .env
+
+      safe_kill_screen "nockbuild"
+
+      echo -e "${CYAN}>> Launching build in screen session 'nockbuild' and logging to build.log...${RESET}"
+      screen -dmS nockbuild bash -c "
+        source \"$SETTINGS_FILE\";
+        cd \$NOCKCHAIN_HOME && {
+          make install-hoonc && \
+          make build && \
+          make install-nockchain-wallet && \
+          make install-nockchain && \
+        echo 'nockchain install completed.'
+        } 2>&1 | tee \$NOCKCHAIN_HOME/nockbuild.log
+        exec bash
+      "
+
+      echo -e "${GREEN}>> Build started in screen session 'nockbuild'.${RESET}"
+      echo -e "${YELLOW}>> To monitor build: ${DIM}screen -r nockbuild${RESET}"
+      echo -e "${DIM}Tip: Press ${CYAN}Ctrl+A${DIM}, then ${CYAN}D${DIM} to detach from the screen without stopping the build.${RESET}"
+      echo -e "${YELLOW}Would you like to attach to the build screen session now? (y/n)${RESET}"
+      while true; do
+        read -rp "$(echo -e "${BOLD_BLUE}> ${RESET}")" ATTACH_BUILD
+        [[ "$ATTACH_BUILD" =~ ^[YyNn]$ ]] && break
+        echo -e "${RED}❌ Please enter y or n.${RESET}"
+      done
+      if [[ "$ATTACH_BUILD" =~ ^[Yy]$ ]]; then
+        screen -r nockbuild
+      else
+        echo -e "${CYAN}Returning to main menu...${RESET}"
+        read -n 1 -s -r -p $'\nPress any key to continue...'
+      fi
+      continue
+    fi
+
+    echo -e "${YELLOW}Press any key to return to the main menu...${RESET}"
+    read -n 1 -s
     continue
     ;;
-  6)
+
+  # ===== Main Menu Option 2 =====
+  2)
     clear
-    require_nockchain || continue
-    # Toggle systemd timer for periodic state.jam backup
-    BACKUP_SERVICE_FILE="/etc/systemd/system/nockchain-statejam-backup.service"
-    BACKUP_TIMER_FILE="/etc/systemd/system/nockchain-statejam-backup.timer"
-    BACKUP_SCRIPT="$NOCKCHAIN_HOME/export_latest_state_jam.sh"
-    # Ensure fzf is installed
-    ensure_fzf_installed
-    # Present fzf menu: start/stop/restart/cancel (with improved entries)
-    menu_entries=("↩️  Cancel and return to main menu" "🟢 Start backup service" "🔄 Restart backup service" "🔴 Stop backup service")
-    selected=$(printf "%s\n" "${menu_entries[@]}" | fzf --prompt="Choose action for backup service: " \
-      --pointer="👉" --color=prompt:blue,fg+:cyan,bg+:238,pointer:green,marker:green \
-      --header=$'\nUse ↑ ↓ arrows to select. ENTER to confirm.\nUseful commands:\n  - systemctl status nockchain-statejam-backup.timer\n  - journalctl -u nockchain-statejam-backup.service -e\n')
-    [[ -z "$selected" ]] && selected="↩️  Cancel and return to main menu"
-    if [[ "$selected" == "↩️  Cancel and return to main menu" ]]; then
+    echo -e "${YELLOW}You are about to update Nockchain to the latest version from GitHub.${RESET}"
+    confirm_yes_no "Continue?" || {
+      echo -e "${CYAN}Returning to menu...${RESET}"
       continue
-    fi
-    # Helper: Create backup script, always overwrite
-    create_backup_script() {
-      echo "[INFO] Overwriting backup script at $BACKUP_SCRIPT..."
-      cat >"$BACKUP_SCRIPT" <<'EOS'
-#!/bin/bash
-source "$HOME/.nockchain_launcher.conf"
-set -euo pipefail
+    }
 
-normalize_block() {
-  local block="$1"
-  if [[ "$block" =~ ^[0-9]{1,3}(\.[0-9]{3})*$ ]]; then
-    echo "$block" | tr -d '.'
-  else
+    safe_kill_screen "nockupdate"
+
+    MINING_KEY_DISPLAY=$(grep "^MINING_PUBKEY=" "$NOCKCHAIN_HOME/.env" | cut -d= -f2)
+    echo -e "${CYAN}>> Launching update and miner restart in screen session 'nockupdate'...${RESET}"
+    screen -dmS nockupdate bash -c "
+      source \"$SETTINGS_FILE\";
+      cd \$NOCKCHAIN_HOME && {
+        git reset --hard HEAD && \
+        git pull && \
+        make install-nockchain && \
+        export PATH=\"\$HOME/.cargo/bin:\$PATH\" && \
+        if tmux ls 2>/dev/null | grep -q '^miner'; then
+          echo '>> Killing tmux miner sessions...'
+          tmux ls 2>/dev/null | grep '^miner' | cut -d: -f1 | xargs -r -n1 tmux kill-session -t
+        fi
+        for d in \$NOCKCHAIN_HOME/miner*; do
+          bash \"$SCRIPT_PATH\" --restart-miner \"\$d\" \"\$MINING_KEY_DISPLAY\"
+        done
+        echo 'Update and restart completed.'
+      } 2>&1 | tee \$NOCKCHAIN_HOME/nockupdate.log
+      exec bash
+    "
     echo ""
-  fi
-}
+    echo -e "${GREEN}✅ Update and miner restart process started.${RESET}"
+    echo -e "${CYAN}📺 Screen session: ${DIM}nockupdate${RESET}"
+    echo ""
+    echo -e "${YELLOW}▶ To monitor progress:${RESET}"
+    echo -e "${DIM}   screen -r nockupdate${RESET}"
+    echo ""
+    echo -e "${YELLOW}▶ To exit the screen without stopping it:${RESET}"
+    echo -e "${DIM}   Press Ctrl+A then D${RESET}"
+    echo ""
 
-SRC=""
-HIGHEST=0
-HIGHEST_BLOCK=""
-
-for d in "$NOCKCHAIN_HOME"/miner[0-9]*; do
-  [[ -d "$d" ]] || continue
-  miner_name=$(basename "$d" | sed -nE 's/^(miner[0-9]+)$/\1/p')
-  [[ -z "$miner_name" ]] && continue
-  log="$d/$miner_name.log"
-  if [[ -f "$log" ]]; then
-    raw_line=$(grep -a 'added to validated blocks at' "$log" 2>/dev/null | tail -n 1 || true)
-    blk=$(echo "$raw_line" | grep -oP 'at\s+\K([0-9]{1,3}(?:\.[0-9]{3})*)' || true)
-    # --- BEGIN logging block per miner ---
-    if [[ -n "$blk" ]]; then
-      echo -e "🟢 Detected $(basename "$d") at block $blk"
-    else
-      echo -e "⚠️ No valid block found in $(basename "$d")"
+    echo -e "${YELLOW}Do you want to attach to the 'nockupdate' screen session now? (y/n)${RESET}"
+    while true; do
+      read -rp "$(echo -e "${BOLD_BLUE}> ${RESET}")" ATTACH_CHOICE
+      [[ "$ATTACH_CHOICE" =~ ^[YyNn]$ ]] && break
+      echo -e "${RED}❌ Please enter y or n.${RESET}"
+    done
+    if [[ "$ATTACH_CHOICE" =~ ^[Yy]$ ]]; then
+      screen -r nockupdate
     fi
-    # --- END logging block per miner ---
-    if [[ -n "$blk" ]]; then
-      num=$(normalize_block "$blk")
-      if (( num > HIGHEST )); then
-        HIGHEST=$num
-        HIGHEST_BLOCK=$blk
-        SRC="$d"
-      fi
-    fi
-  fi
-done
 
-if [[ -z "$SRC" ]]; then
-  echo "[$(date)] ❌ No suitable miner folder found."
-  exit 1
-fi
-
-TMP="$NOCKCHAIN_HOME/miner-export"
-OUT="$NOCKCHAIN_HOME/state.jam"
-
-# Styled user output
-GREEN="\e[32m"
-CYAN="\e[36m"
-BOLD_BLUE="\e[1;34m"
-DIM="\e[2m"
-RESET="\e[0m"
-
-echo -e ""
-echo -e "${DIM}🔍 Found miner with highest block:${RESET} ${CYAN}$(basename "$SRC")${RESET} at block ${BOLD_BLUE}$HIGHEST_BLOCK${RESET}"
-echo -e "${DIM}📁 Creating temporary clone at:${RESET} ${CYAN}$TMP${RESET}"
-rm -rf "$TMP"
-cp -a "$SRC" "$TMP"
-
-cd "$TMP"
-echo -e "${DIM}🧠 Running export-state-jam command...${RESET}"
-"$NOCKCHAIN_BIN" --export-state-jam "$OUT"
-cd "$NOCKCHAIN_HOME"
-
-echo -e ""
-echo -e "${DIM}🧹 Cleaning up temporary folder...${RESET}"
-rm -rf "$TMP"
-
-echo -e "${GREEN}✅ Exported state.jam from block ${BOLD_BLUE}$HIGHEST_BLOCK${GREEN} to ${CYAN}$OUT${RESET}"
-echo "Exported state.jam from block $HIGHEST_BLOCK at $(date '+%Y-%m-%d %H:%M:%S')" >> "$NOCKCHAIN_HOME/statejam_backup.log"
-
-EOS
-      chmod +x "$BACKUP_SCRIPT"
-      if [[ ! -x "$BACKUP_SCRIPT" ]]; then
-        chmod +x "$BACKUP_SCRIPT"
-      fi
-    }
-    # Helper: Write systemd service/timer
-    create_backup_systemd_files() {
-      sudo bash -c "cat > '$BACKUP_SERVICE_FILE'" <<EOS
-[Unit]
-Description=Export latest state.jam from all miners to $NOCKCHAIN_HOME/state.jam
-After=network-online.target
-
-[Service]
-Type=oneshot
-User=$NOCKCHAIN_USER
-ExecStart=$NOCKCHAIN_HOME/export_latest_state_jam.sh
-
-[Install]
-WantedBy=multi-user.target
-EOS
-      sudo bash -c "cat > '$BACKUP_TIMER_FILE'" <<EOS
-[Unit]
-Description=Run state.jam export every hour
-
-[Timer]
-OnCalendar=hourly
-Persistent=true
-
-[Install]
-WantedBy=timers.target
-EOS
-      sudo systemctl daemon-reload
-    }
-    # Helper: Enable and start timer
-    enable_and_start_timer() {
-      sudo systemctl enable --now nockchain-statejam-backup.timer
-      if ! systemctl list-timers --all | grep -q "nockchain-statejam-backup.timer"; then
-        echo -e "${RED}❌ Failed to enable backup timer.${RESET}"
-        return 1
-      fi
-      return 0
-    }
-    # Helper: Stop and disable timer
-    stop_and_disable_timer() {
-      sudo systemctl stop nockchain-statejam-backup.timer
-      sudo systemctl disable nockchain-statejam-backup.timer
-    }
-    # Helper: Dry run log streaming
-    dry_run_and_stream_log() {
-      echo -e "${CYAN}▶ Running backup script manually to verify setup...${RESET}"
-      echo -e "${CYAN}▶ Output log: ${DIM}$NOCKCHAIN_HOME/statejam_backup.log${RESET}"
-      rm -f "$NOCKCHAIN_HOME/statejam_backup.log"
-      touch "$NOCKCHAIN_HOME/statejam_backup.log"
-
-      echo -e ""
-      "$BACKUP_SCRIPT" 2>&1 | tee -a "$NOCKCHAIN_HOME/statejam_backup.log"
-      echo ""
-      echo -e "${YELLOW}Press any key to return to the main menu...${RESET}"
-      read -n 1 -s
-    }
-    # Handle selection
-    if [[ "$selected" == "🟢 Start backup service" ]]; then
-      clear
-      echo -e "${CYAN}▶ Creating backup script...${RESET}"
-      create_backup_script
-      if [[ ! -f "$BACKUP_SCRIPT" || ! -x "$BACKUP_SCRIPT" ]]; then
-        echo -e "${RED}❌ Export script was not created. Aborting.${RESET}"
-        read -n 1 -s
-        continue
-      fi
-      echo -e "${CYAN}▶ Writing systemd service and timer files...${RESET}"
-      create_backup_systemd_files
-      if enable_and_start_timer; then
-        echo -e "${CYAN}▶ Starting backup timer service...${RESET}"
-        echo -e ""
-        echo -e "${CYAN}▶ Backup service setup complete.${RESET}"
-        echo -e "${CYAN}▶ Service: statejam backup${RESET}"
-        echo -e "${CYAN}▶ Status: ENABLED and scheduled every hour${RESET}"
-        echo -e "${CYAN}▶ Backup script: ${DIM}$BACKUP_SCRIPT${RESET}"
-        echo -e "${CYAN}▶ Target location: ${DIM}$NOCKCHAIN_HOME/state.jam${RESET}"
-        echo -e ""
-        echo -e "${CYAN}▶ Performing dry run to verify backup...${RESET}"
-        dry_run_and_stream_log
-      else
-        echo -e "${RED}❌ Failed to enable/launch backup timer.${RESET}"
-        read -n 1 -s
-        continue
-      fi
-      continue
-    elif [[ "$selected" == "🔴 Stop backup service" ]]; then
-      clear
-      echo -e "${CYAN}🛑 Stopping periodic state.jam backup service...${RESET}"
-      stop_and_disable_timer
-      echo -e "${GREEN}✅ Disabled nockchain-statejam-backup.timer${RESET}"
-      echo -e "${GREEN}✅ Periodic state.jam backup is now DISABLED.${RESET}"
-      echo ""
-      echo -e "${YELLOW}Press any key to return to the main menu...${RESET}"
-      read -n 1 -s
-      continue
-    elif [[ "$selected" == "🔄 Restart backup service" ]]; then
-      clear
-      echo -e "${CYAN}▶ Stopping backup service if running...${RESET}"
-      stop_and_disable_timer
-      echo -e "${BOLD_BLUE}▶ Creating backup script...${RESET}"
-      rm -f "$BACKUP_SCRIPT"
-      create_backup_script
-      if [[ ! -f "$BACKUP_SCRIPT" || ! -x "$BACKUP_SCRIPT" ]]; then
-        echo -e "${RED}❌ Export script was not created. Aborting.${RESET}"
-        read -n 1 -s
-        continue
-      fi
-      echo -e "${CYAN}▶ Writing systemd service and timer files...${RESET}"
-      rm -f "$BACKUP_SERVICE_FILE" "$BACKUP_TIMER_FILE"
-      create_backup_systemd_files
-      if enable_and_start_timer; then
-        echo -e "${CYAN}▶ Starting backup timer service...${RESET}"
-        echo -e ""
-        echo -e "${CYAN}▶ Backup service setup complete.${RESET}"
-        echo -e "${CYAN}▶ Service: statejam backup${RESET}"
-        echo -e "${CYAN}▶ Status: ENABLED and scheduled every hour${RESET}"
-        echo -e "${CYAN}▶ Backup script:${RESET} ${DIM}$BACKUP_SCRIPT${RESET}"
-        echo -e "${CYAN}▶ Target location: ${DIM}$NOCKCHAIN_HOME/state.jam${RESET}"
-        echo -e ""
-        echo -e "${CYAN}▶ Performing dry run to verify backup...${RESET}"
-        dry_run_and_stream_log
-      else
-        echo -e "${RED}❌ Failed to enable/launch backup timer.${RESET}"
-        read -n 1 -s
-        continue
-      fi
-      continue
-    fi
+    echo -e "${YELLOW}Press any key to return to the main menu...${RESET}"
+    read -n 1 -s
+    continue
     ;;
+
+  # ===== Main Menu Option 3 =====
+  3)
+    clear
+    echo -e "${YELLOW}You are about to update only the Nockchain Wallet (nockchain-wallet).${RESET}"
+    confirm_yes_no "Continue?" || {
+      echo -e "${CYAN}Returning to menu...${RESET}"
+      continue
+    }
+
+    safe_kill_screen "walletupdate"
+
+    echo -e "${CYAN}>> Launching wallet update in screen session 'walletupdate'...${RESET}"
+    screen -dmS walletupdate bash -c "
+      source \"$SETTINGS_FILE\";
+      cd \$NOCKCHAIN_HOME && {
+        git pull && \
+        make install-nockchain-wallet && \
+        export PATH=\"\$HOME/.cargo/bin:\$PATH\" && \
+        echo 'Wallet update completed.'
+      } 2>&1 | tee \$NOCKCHAIN_HOME/walletupdate.log
+      exec bash
+    "
+    echo -e "${GREEN}✅ Wallet update started in screen session 'walletupdate'.${RESET}"
+    echo -e "${YELLOW}To monitor: ${DIM}screen -r walletupdate${RESET}"
+    echo -e "${CYAN}To exit screen: ${DIM}Ctrl+A then D${RESET}"
+
+    echo -e "${YELLOW}Do you want to attach to the 'walletupdate' screen session now? (y/n)${RESET}"
+    while true; do
+      read -rp "$(echo -e "${BOLD_BLUE}> ${RESET}")" ATTACH_WALLET
+      [[ "$ATTACH_WALLET" =~ ^[YyNn]$ ]] && break
+      echo -e "${RED}❌ Please enter y or n.${RESET}"
+    done
+    if [[ "$ATTACH_WALLET" =~ ^[Yy]$ ]]; then
+      screen -r walletupdate
+    fi
+
+    echo -e "${YELLOW}Press any key to return to the main menu...${RESET}"
+    read -n 1 -s
+    continue
+    ;;
+
+  # ===== Main Menu Option 4 =====
+  4)
+    clear
+    echo -e "${YELLOW}You are about to update the launcher script to the latest version from GitHub.${RESET}"
+    confirm_yes_no "Continue?" || {
+      echo -e "${CYAN}Returning to menu...${RESET}"
+      continue
+    }
+
+    TEMP_PATH="/tmp/nockchain_launcher.sh"
+    TEMP_VERSION="/tmp/NOCKCHAIN_LAUNCHER_VERSION"
+
+    echo -e "${CYAN}>> Downloading latest launcher script...${RESET}"
+    if ! curl -fsSL https://raw.githubusercontent.com/jobless0x/nockchain-launcher/main/nockchain_launcher.sh -o "$TEMP_PATH"; then
+      echo -e "${RED}❌ Failed to download the launcher script.${RESET}"
+      continue
+    fi
+
+    echo -e "${CYAN}>> Downloading version file...${RESET}"
+    if ! curl -fsSL https://raw.githubusercontent.com/jobless0x/nockchain-launcher/main/NOCKCHAIN_LAUNCHER_VERSION -o "$TEMP_VERSION"; then
+      echo -e "${RED}❌ Failed to download the version file.${RESET}"
+      continue
+    fi
+
+    echo -e "${CYAN}>> Replacing launcher and version file...${RESET}"
+    cp "$TEMP_PATH" "$SCRIPT_PATH"
+    cp "$TEMP_VERSION" "$LAUNCHER_VERSION_FILE"
+    chmod +x "$SCRIPT_PATH"
+
+    echo -e "${GREEN}✅ Launcher updated successfully.${RESET}"
+    echo -e "${YELLOW}Press any key to restart the launcher with the updated version...${RESET}"
+    read -n 1 -s
+    "$SCRIPT_PATH"
+    exit 0
+    ;;
+
+  # ===== Main Menu Option 5 =====
   5)
     clear
     require_nockchain || continue
@@ -1351,324 +1331,722 @@ EOF
     continue
     ;;
 
-  21)
+  # ===== Main Menu Option 6 =====
+  6)
     clear
-    echo -e "${CYAN}System Diagnostics${RESET}"
-    echo ""
-
-    # Diagnostics: Verify required tools are installed
-    echo -e "${CYAN}▶ Required Commands${RESET}"
-    echo -e "${DIM}-------------------${RESET}"
-    for cmd in tmux screen cargo git curl make; do
-      if command -v "$cmd" &>/dev/null; then
-        echo -e "${GREEN}✔ $cmd found${RESET}"
-      else
-        echo -e "${RED}❌ $cmd missing${RESET}"
-      fi
-    done
-    echo ""
-
-    # Diagnostics: Check for Nockchain and wallet binary presence
-    echo -e "${CYAN}▶ Key Paths & Binaries${RESET}"
-    echo -e "${DIM}----------------------${RESET}"
-    [[ -x "$NOCKCHAIN_BIN" ]] && echo -e "${GREEN}✔ nockchain binary present${RESET}" || echo -e "${RED}❌ nockchain binary missing${RESET}"
-    [[ -x "$HOME/.cargo/bin/nockchain-wallet" ]] && echo -e "${GREEN}✔ nockchain-wallet present${RESET}" || echo -e "${RED}❌ nockchain-wallet missing${RESET}"
-    echo ""
-
-    # Diagnostics: Validate .env presence and mining key definition
-    echo -e "${CYAN}▶ .env & MINING_PUBKEY${RESET}"
-    echo -e "${DIM}-----------------------${RESET}"
-    if [[ -f "$NOCKCHAIN_HOME/.env" ]]; then
-      echo -e "${GREEN}✔ .env file found${RESET}"
-      if grep -q "^MINING_PUBKEY=" "$NOCKCHAIN_HOME/.env"; then
-        echo -e "${GREEN}✔ MINING_PUBKEY is defined${RESET}"
-      else
-        echo -e "${RED}❌ MINING_PUBKEY not found in .env${RESET}"
-      fi
-    else
-      echo -e "${RED}❌ .env file is missing${RESET}"
-    fi
-    echo ""
-
-    # Diagnostics: Count miner directories in local nockchain path
-    echo -e "${CYAN}▶ Miner Folders${RESET}"
-    echo -e "${DIM}--------------${RESET}"
-    miner_count=$(find "$NOCKCHAIN_HOME" -maxdepth 1 -type d -name "miner[0-9]*" 2>/dev/null | wc -l)
-    if ((miner_count > 0)); then
-      echo -e "${GREEN}✔ $miner_count miner folder(s) found${RESET}"
-    else
-      echo -e "${RED}❌ No miner folders found${RESET}"
-    fi
-    echo ""
-
-    # Diagnostics: Compare local vs remote git commit hash
-    echo -e "${CYAN}▶ Nockchain Repository${RESET}"
-    echo -e "${DIM}----------------------${RESET}"
-    if [[ ! -d "$NOCKCHAIN_HOME" ]]; then
-      echo -e "${YELLOW}Nockchain is not installed yet.${RESET}"
-    elif [[ ! -d "$NOCKCHAIN_HOME/.git" ]]; then
-      echo -e "${YELLOW}Nockchain exists but is not a Git repository.${RESET}"
-    elif git -C "$NOCKCHAIN_HOME" rev-parse &>/dev/null; then
-      BRANCH=$(git -C "$NOCKCHAIN_HOME" rev-parse --abbrev-ref HEAD)
-      REMOTE_URL=$(git -C "$NOCKCHAIN_HOME" config --get remote.origin.url)
-      LOCAL_HASH=$(git -C "$NOCKCHAIN_HOME" rev-parse "$BRANCH")
-      REMOTE_HASH=$(git -C "$NOCKCHAIN_HOME" ls-remote origin "refs/heads/$BRANCH" | awk '{print $1}')
-
-      printf "${GREEN}✔ %-15s${CYAN}%s${RESET}\n" "Remote URL:" "$REMOTE_URL"
-      printf "${GREEN}✔ %-15s${BOLD_BLUE}%s${RESET}\n" "Branch:" "$BRANCH"
-
-      if [[ "$LOCAL_HASH" != "$REMOTE_HASH" ]]; then
-        printf "${RED}❌ %-15s%s${RESET}\n" "Status:" "Update available"
-      else
-        printf "${GREEN}✔ %-15s%s\n" "Status:" "Repo is up to date with remote."
-      fi
-    else
-      echo -e "${RED}❌ Git repo appears broken${RESET}"
-    fi
-    echo ""
-
-    # Diagnostics: Verify internet access to GitHub
-    echo -e "${CYAN}▶ Internet Check${RESET}"
-    echo -e "${DIM}-----------------${RESET}"
-    if curl -fsSL https://github.com >/dev/null 2>&1; then
-      echo -e "${GREEN}✔ GitHub is reachable${RESET}"
-    else
-      echo -e "${RED}❌ Cannot reach GitHub${RESET}"
-    fi
-
-    echo ""
-    # Diagnostics: Check launcher version sync against GitHub
-    echo -e "${CYAN}▶ Launcher Update Check${RESET}"
-    echo -e "${DIM}-----------------------${RESET}"
-    printf "${GREEN}✔ %-15s${BOLD_BLUE}%s${RESET}\n" "Local:" "$LAUNCHER_VERSION"
-    if [[ -z "$REMOTE_VERSION" ]]; then
-      printf "${YELLOW}⚠ %-15s%s${RESET}\n" "Remote:" "Unavailable (offline or fetch error)"
-    else
-      printf "${GREEN}✔ %-15s${CYAN}%s${RESET}\n" "Remote:" "$REMOTE_VERSION"
-      if [[ "$LAUNCHER_VERSION" == "$REMOTE_VERSION" ]]; then
-        printf "${GREEN}✔ %-15s%s\n" "Status:" "Up to date"
-      else
-        printf "${RED}❌ %-15s%s${RESET}\n" "Status:" "Update available"
-      fi
-    fi
-    echo ""
-
-    echo -e "${YELLOW}Press any key to return to the main menu...${RESET}"
-    read -n 1 -s
-    continue
-    ;;
-  1)
-    clear
-
-    echo -e "${YELLOW}⚠️  This will install Nockchain from scratch. This may overwrite existing files.${RESET}"
-    confirm_yes_no "Are you sure you want to continue?" || {
-      echo -e "${CYAN}Returning to menu...${RESET}"
+    require_nockchain || continue
+    # Toggle systemd timer for periodic state.jam backup
+    BACKUP_SERVICE_FILE="/etc/systemd/system/nockchain-statejam-backup.service"
+    BACKUP_TIMER_FILE="/etc/systemd/system/nockchain-statejam-backup.timer"
+    BACKUP_SCRIPT="$NOCKCHAIN_HOME/export_latest_state_jam.sh"
+    # Ensure fzf is installed
+    ensure_fzf_installed
+    # Present fzf menu: start/stop/restart/cancel (with improved entries)
+    menu_entries=("↩️  Cancel and return to main menu" "🟢 Start backup service" "🔄 Restart backup service" "🔴 Stop backup service")
+    selected=$(printf "%s\n" "${menu_entries[@]}" | fzf --prompt="Choose action for backup service: " \
+      --pointer="👉" --color=prompt:blue,fg+:cyan,bg+:238,pointer:green,marker:green \
+      --header=$'\nUse ↑ ↓ arrows to select. ENTER to confirm.\nUseful commands:\n  - systemctl status nockchain-statejam-backup.timer\n  - journalctl -u nockchain-statejam-backup.service -e\n')
+    [[ -z "$selected" ]] && selected="↩️  Cancel and return to main menu"
+    if [[ "$selected" == "↩️  Cancel and return to main menu" ]]; then
       continue
-    }
+    fi
+    # Helper: Create backup script, always overwrite
+    create_backup_script() {
+      echo "[INFO] Overwriting backup script at $BACKUP_SCRIPT..."
+      cat >"$BACKUP_SCRIPT" <<'EOS'
+#!/bin/bash
+source "$HOME/.nockchain_launcher.conf"
+set -euo pipefail
 
-    # Handle sudo and root system preparation
-    if [ "$(id -u)" -eq 0 ]; then
-      echo -e "${YELLOW}>> Running as root. Updating system and installing sudo...${RESET}"
-      apt-get update && apt-get upgrade -y
+normalize_block() {
+  local block="$1"
+  if [[ "$block" =~ ^[0-9]{1,3}(\.[0-9]{3})*$ ]]; then
+    echo "$block" | tr -d '.'
+  else
+    echo ""
+  fi
+}
 
-      if ! command -v sudo &>/dev/null; then
-        apt-get install sudo -y
+SRC=""
+HIGHEST=0
+HIGHEST_BLOCK=""
+
+for d in "$NOCKCHAIN_HOME"/miner[0-9]*; do
+  [[ -d "$d" ]] || continue
+  miner_name=$(basename "$d" | sed -nE 's/^(miner[0-9]+)$/\1/p')
+  [[ -z "$miner_name" ]] && continue
+  log="$d/$miner_name.log"
+  if [[ -f "$log" ]]; then
+    raw_line=$(grep -a 'added to validated blocks at' "$log" 2>/dev/null | tail -n 1 || true)
+    blk=$(echo "$raw_line" | grep -oP 'at\s+\K([0-9]{1,3}(?:\.[0-9]{3})*)' || true)
+    # --- BEGIN logging block per miner ---
+    if [[ -n "$blk" ]]; then
+      echo -e "🟢 Detected $(basename "$d") at block $blk"
+    else
+      echo -e "⚠️ No valid block found in $(basename "$d")"
+    fi
+    # --- END logging block per miner ---
+    if [[ -n "$blk" ]]; then
+      num=$(normalize_block "$blk")
+      if (( num > HIGHEST )); then
+        HIGHEST=$num
+        HIGHEST_BLOCK=$blk
+        SRC="$d"
       fi
     fi
+  fi
+done
 
-    if [ ! -f "$BINARY_PATH" ]; then
-      echo -e "${YELLOW}>> Nockchain not built yet. Starting Phase 1 (Build)...${RESET}"
+if [[ -z "$SRC" ]]; then
+  echo "[$(date)] ❌ No suitable miner folder found."
+  exit 1
+fi
 
-      echo -e "${CYAN}>> Installing system dependencies...${RESET}"
-      sudo apt-get update && sudo apt-get upgrade -y
-      sudo apt install -y curl iptables build-essential ufw screen git wget lz4 jq make gcc nano automake autoconf tmux htop nvme-cli libgbm1 pkg-config libssl-dev libleveldb-dev tar clang bsdmainutils ncdu unzip libclang-dev llvm-dev
+TMP="$NOCKCHAIN_HOME/miner-export"
+OUT="$NOCKCHAIN_HOME/state.jam"
 
-      if [[ ! -f "$HOME/.cargo/env" ]]; then
-        echo -e "${YELLOW}⚠️  .cargo/env missing. Installing Rust using rustup...${RESET}"
-        if ! curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y; then
-          echo -e "${RED}❌ Rust installation failed. Aborting.${RESET}"
-          exit 1
-        fi
+# Styled user output
+GREEN="\e[32m"
+CYAN="\e[36m"
+BOLD_BLUE="\e[1;34m"
+DIM="\e[2m"
+RESET="\e[0m"
+
+echo -e ""
+echo -e "${DIM}🔍 Found miner with highest block:${RESET} ${CYAN}$(basename "$SRC")${RESET} at block ${BOLD_BLUE}$HIGHEST_BLOCK${RESET}"
+echo -e "${DIM}📁 Creating temporary clone at:${RESET} ${CYAN}$TMP${RESET}"
+rm -rf "$TMP"
+cp -a "$SRC" "$TMP"
+
+cd "$TMP"
+echo -e "${DIM}🧠 Running export-state-jam command...${RESET}"
+"$NOCKCHAIN_BIN" --export-state-jam "$OUT"
+cd "$NOCKCHAIN_HOME"
+
+echo -e ""
+echo -e "${DIM}🧹 Cleaning up temporary folder...${RESET}"
+rm -rf "$TMP"
+
+echo -e "${GREEN}✅ Exported state.jam from block ${BOLD_BLUE}$HIGHEST_BLOCK${GREEN} to ${CYAN}$OUT${RESET}"
+echo "Exported state.jam from block $HIGHEST_BLOCK at $(date '+%Y-%m-%d %H:%M:%S')" >> "$NOCKCHAIN_HOME/statejam_backup.log"
+
+EOS
+      chmod +x "$BACKUP_SCRIPT"
+      if [[ ! -x "$BACKUP_SCRIPT" ]]; then
+        chmod +x "$BACKUP_SCRIPT"
       fi
+    }
+    # Helper: Write systemd service/timer
+    create_backup_systemd_files() {
+      sudo bash -c "cat > '$BACKUP_SERVICE_FILE'" <<EOS
+[Unit]
+Description=Export latest state.jam from all miners to $NOCKCHAIN_HOME/state.jam
+After=network-online.target
 
-      if [[ -f "$HOME/.cargo/env" ]]; then
-        source "$HOME/.cargo/env"
+[Service]
+Type=oneshot
+User=$NOCKCHAIN_USER
+ExecStart=$NOCKCHAIN_HOME/export_latest_state_jam.sh
+
+[Install]
+WantedBy=multi-user.target
+EOS
+      sudo bash -c "cat > '$BACKUP_TIMER_FILE'" <<EOS
+[Unit]
+Description=Run state.jam export every hour
+
+[Timer]
+OnCalendar=hourly
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOS
+      sudo systemctl daemon-reload
+    }
+    # Helper: Enable and start timer
+    enable_and_start_timer() {
+      sudo systemctl enable --now nockchain-statejam-backup.timer
+      if ! systemctl list-timers --all | grep -q "nockchain-statejam-backup.timer"; then
+        echo -e "${RED}❌ Failed to enable backup timer.${RESET}"
+        return 1
+      fi
+      return 0
+    }
+    # Helper: Stop and disable timer
+    stop_and_disable_timer() {
+      sudo systemctl stop nockchain-statejam-backup.timer
+      sudo systemctl disable nockchain-statejam-backup.timer
+    }
+    # Helper: Dry run log streaming
+    dry_run_and_stream_log() {
+      echo -e "${CYAN}▶ Running backup script manually to verify setup...${RESET}"
+      echo -e "${CYAN}▶ Output log: ${DIM}$NOCKCHAIN_HOME/statejam_backup.log${RESET}"
+      rm -f "$NOCKCHAIN_HOME/statejam_backup.log"
+      touch "$NOCKCHAIN_HOME/statejam_backup.log"
+
+      echo -e ""
+      "$BACKUP_SCRIPT" 2>&1 | tee -a "$NOCKCHAIN_HOME/statejam_backup.log"
+      echo ""
+      echo -e "${YELLOW}Press any key to return to the main menu...${RESET}"
+      read -n 1 -s
+    }
+    # Handle selection
+    if [[ "$selected" == "🟢 Start backup service" ]]; then
+      clear
+      echo -e "${CYAN}▶ Creating backup script...${RESET}"
+      create_backup_script
+      if [[ ! -f "$BACKUP_SCRIPT" || ! -x "$BACKUP_SCRIPT" ]]; then
+        echo -e "${RED}❌ Export script was not created. Aborting.${RESET}"
+        read -n 1 -s
+        continue
+      fi
+      echo -e "${CYAN}▶ Writing systemd service and timer files...${RESET}"
+      create_backup_systemd_files
+      if enable_and_start_timer; then
+        echo -e "${CYAN}▶ Starting backup timer service...${RESET}"
+        echo -e ""
+        echo -e "${CYAN}▶ Backup service setup complete.${RESET}"
+        echo -e "${CYAN}▶ Service: statejam backup${RESET}"
+        echo -e "${CYAN}▶ Status: ENABLED and scheduled every hour${RESET}"
+        echo -e "${CYAN}▶ Backup script: ${DIM}$BACKUP_SCRIPT${RESET}"
+        echo -e "${CYAN}▶ Target location: ${DIM}$NOCKCHAIN_HOME/state.jam${RESET}"
+        echo -e ""
+        echo -e "${CYAN}▶ Performing dry run to verify backup...${RESET}"
+        dry_run_and_stream_log
       else
-        echo -e "${RED}❌ Rust environment setup failed. Aborting.${RESET}"
-        exit 1
+        echo -e "${RED}❌ Failed to enable/launch backup timer.${RESET}"
+        read -n 1 -s
+        continue
+      fi
+      continue
+    elif [[ "$selected" == "🔴 Stop backup service" ]]; then
+      clear
+      echo -e "${CYAN}🛑 Stopping periodic state.jam backup service...${RESET}"
+      stop_and_disable_timer
+      echo -e "${GREEN}✅ Disabled nockchain-statejam-backup.timer${RESET}"
+      echo -e "${GREEN}✅ Periodic state.jam backup is now DISABLED.${RESET}"
+      echo ""
+      echo -e "${YELLOW}Press any key to return to the main menu...${RESET}"
+      read -n 1 -s
+      continue
+    elif [[ "$selected" == "🔄 Restart backup service" ]]; then
+      clear
+      echo -e "${CYAN}▶ Stopping backup service if running...${RESET}"
+      stop_and_disable_timer
+      echo -e "${BOLD_BLUE}▶ Creating backup script...${RESET}"
+      rm -f "$BACKUP_SCRIPT"
+      create_backup_script
+      if [[ ! -f "$BACKUP_SCRIPT" || ! -x "$BACKUP_SCRIPT" ]]; then
+        echo -e "${RED}❌ Export script was not created. Aborting.${RESET}"
+        read -n 1 -s
+        continue
+      fi
+      echo -e "${CYAN}▶ Writing systemd service and timer files...${RESET}"
+      rm -f "$BACKUP_SERVICE_FILE" "$BACKUP_TIMER_FILE"
+      create_backup_systemd_files
+      if enable_and_start_timer; then
+        echo -e "${CYAN}▶ Starting backup timer service...${RESET}"
+        echo -e ""
+        echo -e "${CYAN}▶ Backup service setup complete.${RESET}"
+        echo -e "${CYAN}▶ Service: statejam backup${RESET}"
+        echo -e "${CYAN}▶ Status: ENABLED and scheduled every hour${RESET}"
+        echo -e "${CYAN}▶ Backup script:${RESET} ${DIM}$BACKUP_SCRIPT${RESET}"
+        echo -e "${CYAN}▶ Target location: ${DIM}$NOCKCHAIN_HOME/state.jam${RESET}"
+        echo -e ""
+        echo -e "${CYAN}▶ Performing dry run to verify backup...${RESET}"
+        dry_run_and_stream_log
+      else
+        echo -e "${RED}❌ Failed to enable/launch backup timer.${RESET}"
+        read -n 1 -s
+        continue
+      fi
+      continue
+    fi
+    ;;
+
+  # ===== Main Menu Option 11 =====
+  11)
+    clear
+    # Check for miner directories before proceeding to live monitor
+    miner_dirs=$(find "$NOCKCHAIN_HOME" -maxdepth 1 -type d -name "miner[0-9]*" 2>/dev/null)
+    if [[ -z "$miner_dirs" ]]; then
+      echo -e "${YELLOW}No miners found. Nothing to monitor.${RESET}"
+      read -n 1 -s -r -p $'\nPress any key to return to the main menu...'
+      continue
+    fi
+
+    # Calculate total system memory in GB for MEM % -> GB conversion (outside the loop, only once)
+    TOTAL_MEM_KB=$(grep MemTotal /proc/meminfo | awk '{print $2}')
+    TOTAL_MEM_GB=$(awk "BEGIN { printf \"%.1f\", $TOTAL_MEM_KB/1024/1024 }")
+
+    while true; do
+      # Print Live Miner Monitor
+      tput cup 0 0
+      echo -e "${DIM}🖥️  Live Miner Monitor ${RESET}"
+
+      # Extract network height from all miner logs (live, every refresh, OPTIMIZED)
+      NETWORK_HEIGHT=$(get_network_height)
+
+      # State.jam status line
+      output=$(get_latest_statejam_block | tr '|' ' ' 2>/dev/null || echo "-- --")
+      read statejam_blk statejam_mins <<<"$output"
+      blk_disp="${statejam_blk:---}"
+      min_disp="${statejam_mins:---}"
+
+      # Colorized state.jam status
+      if systemctl is-active --quiet nockchain-statejam-backup.timer; then
+        if [[ "$min_disp" == "running" ]]; then
+          STATEJAM_STATUS="${CYAN}state.jam:${RESET} ${YELLOW}block $blk_disp${RESET}, ${YELLOW}backup running${RESET}"
+        else
+          STATEJAM_STATUS="${CYAN}state.jam:${RESET} ${YELLOW}block $blk_disp${RESET}, next in ${YELLOW}${min_disp}m${RESET}"
+        fi
+      else
+        STATEJAM_STATUS="${CYAN}state.jam:${RESET} ${RED}backup inactive${RESET}"
       fi
 
-      echo -e "${CYAN}>> Cloning Nockchain repo and starting build...${RESET}"
-      rm -rf "$NOCKCHAIN_HOME" "$HOME/.nockapp"
-      git clone https://github.com/zorp-corp/nockchain "$NOCKCHAIN_HOME"
-      cd "$NOCKCHAIN_HOME"
-      cp .env_example .env
+      # Print Network height and state.jam status
+      echo ""
+      echo -e "${CYAN}📡 Network height: ${YELLOW}$NETWORK_HEIGHT${RESET}  |  $STATEJAM_STATUS"
 
-      safe_kill_screen "nockbuild"
+      # Display total CPU and MEM usage
+      TOTAL_CPU=$(get_total_cpu_usage)
+      read TOTAL_MEM_PCT TOTAL_MEM_USED TOTAL_MEM_TOTAL < <(get_total_mem_usage)
 
-      echo -e "${CYAN}>> Launching build in screen session 'nockbuild' and logging to build.log...${RESET}"
-      screen -dmS nockbuild bash -c "
-        source \"$SETTINGS_FILE\";
-        cd \$NOCKCHAIN_HOME && {
-          make install-hoonc && \
-          make build && \
-          make install-nockchain-wallet && \
-          make install-nockchain && \
-        echo 'nockchain install completed.'
-        } 2>&1 | tee \$NOCKCHAIN_HOME/nockbuild.log
-        exec bash
-      "
+      # Print total CPU and MEM usage
+      echo ""
+      printf "${CYAN}🧮 Total CPU Usage:${RESET} ${YELLOW}%-6s%%${RESET} | ${CYAN}Total Mem:${RESET} ${YELLOW}%s%%${RESET} (${YELLOW}%s${RESET}/${YELLOW}%s${RESET} GB)\n" \
+        "$TOTAL_CPU" "$TOTAL_MEM_PCT" "$TOTAL_MEM_USED" "$TOTAL_MEM_TOTAL"
+      echo ""
+      printf "   | %-9s | %-9s | %-9s | %-9s | %-9s | %-9s | %-5s | %-9s | %-6s | %-9s | %-9s | %-9s | %-9s\n" \
+        "Miner" "Uptime" "CPU" "MEM" "RAM (GB)" "Block" "Lag" "Status" "Peers" "LastProof" "AvgProof" "BlkAge" "AvgBlk"
 
-      echo -e "${GREEN}>> Build started in screen session 'nockbuild'.${RESET}"
-      echo -e "${YELLOW}>> To monitor build: ${DIM}screen -r nockbuild${RESET}"
-      echo -e "${DIM}Tip: Press ${CYAN}Ctrl+A${DIM}, then ${CYAN}D${DIM} to detach from the screen without stopping the build.${RESET}"
-      echo -e "${YELLOW}Would you like to attach to the build screen session now? (y/n)${RESET}"
-      while true; do
-        read -rp "$(echo -e "${BOLD_BLUE}> ${RESET}")" ATTACH_BUILD
-        [[ "$ATTACH_BUILD" =~ ^[YyNn]$ ]] && break
-        echo -e "${RED}❌ Please enter y or n.${RESET}"
+      all_miners=()
+      for miner_dir in "$NOCKCHAIN_HOME"/miner[0-9]*; do
+        [ -d "$miner_dir" ] || continue
+        all_miners+=("$(basename "$miner_dir")")
       done
-      if [[ "$ATTACH_BUILD" =~ ^[Yy]$ ]]; then
-        screen -r nockbuild
-      else
-        echo -e "${CYAN}Returning to main menu...${RESET}"
-        read -n 1 -s -r -p $'\nPress any key to continue...'
+      IFS=$'\n' sorted_miners=($(printf "%s\n" "${all_miners[@]}" | sort -V))
+      unset IFS
+      if [[ ${#sorted_miners[@]} -eq 0 ]]; then
+        echo -e "${YELLOW}No miners found or unable to read data.${RESET}"
+        echo -e "${YELLOW}Press Enter to return to menu...${RESET}"
+        read
+        break
       fi
-      continue
-    fi
 
-    echo -e "${YELLOW}Press any key to return to the main menu...${RESET}"
-    read -n 1 -s
-    continue
-    ;;
-  2)
-    clear
-    echo -e "${YELLOW}You are about to update Nockchain to the latest version from GitHub.${RESET}"
-    confirm_yes_no "Continue?" || {
-      echo -e "${CYAN}Returning to menu...${RESET}"
-      continue
-    }
+      # Color variables for peer display
+      CYAN="\033[36m"
+      BOLD_BLUE="\033[1;34m"
+      DIM="\033[2m"
+      MAGENTA="\033[35m"
+      WHITE="\033[97m"
+      RED="\033[31m"
+      GREEN="\033[32m"
+      YELLOW="\033[33m"
+      RESET="\033[0m"
 
-    safe_kill_screen "nockupdate"
+      for session in "${sorted_miners[@]}"; do
+        session=$(echo "$session" | sed -nE 's/^(miner[0-9]+)$/\1/p')
+        [[ -z "$session" ]] && continue
+        miner_dir="$NOCKCHAIN_HOME/$session"
+        log_file="$miner_dir/${session}.log"
 
-    MINING_KEY_DISPLAY=$(grep "^MINING_PUBKEY=" "$NOCKCHAIN_HOME/.env" | cut -d= -f2)
-    echo -e "${CYAN}>> Launching update and miner restart in screen session 'nockupdate'...${RESET}"
-    screen -dmS nockupdate bash -c "
-      source \"$SETTINGS_FILE\";
-      cd \$NOCKCHAIN_HOME && {
-        git reset --hard HEAD && \
-        git pull && \
-        make install-nockchain && \
-        export PATH=\"\$HOME/.cargo/bin:\$PATH\" && \
-        if tmux ls 2>/dev/null | grep -q '^miner'; then
-          echo '>> Killing tmux miner sessions...'
-          tmux ls 2>/dev/null | grep '^miner' | cut -d: -f1 | xargs -r -n1 tmux kill-session -t
+        # --- INITIALIZE all variables ---
+        lag="--"
+        lag_int=0
+        is_active=0
+        icon="${DIM}${RED}❌${RESET}"
+        readable="--"
+        cpu="--"
+        mem="--"
+        mem_gb="--"
+        latest_block="--"
+        peer_count="--"
+        last_comp="--"
+        avg_comp="--"
+        last_blk="--"
+        avg_blk="--"
+        status_raw="INACTIVE"
+
+        mine_flag=$(awk -v section="[$session]" '
+          $0 == section {found=1; next}
+          /^\[.*\]/ {found=0}
+          found && /^MINE_FLAG=/ {sub(/^MINE_FLAG=/, ""); print; exit}
+        ' "$LAUNCH_CFG")
+
+        # --- Populate values ---
+        proof_metrics=$(update_proof_durations "$session")
+        IFS='|' read -r last_comp avg_comp <<<"$proof_metrics"
+        last_comp=${last_comp:-"--"}
+        avg_comp=${avg_comp:-"--"}
+
+        block_metrics=$(get_block_deltas "$session")
+        IFS='|' read -r last_blk avg_blk <<<"$block_metrics"
+        last_blk=${last_blk:-"--"}
+        avg_blk=${avg_blk:-"--"}
+
+        avg_blk=$(echo "$avg_blk" | tr -d '\n\r')
+        [[ -z "$avg_blk" ]] && avg_blk="--"
+
+        if systemctl is-active --quiet nockchain-$session 2>/dev/null; then
+          is_active=1
+          icon="${GREEN}🟢${RESET}"
+
+          miner_pid=$(systemctl show -p MainPID --value nockchain-$session)
+          # Uptime
+          if [[ -n "${miner_pid:-}" && "$miner_pid" =~ ^[0-9]+$ ]]; then
+            if [[ "$miner_pid" -gt 1 && -r "/proc/$miner_pid/stat" ]]; then
+              proc_start_ticks=$(awk '{print $22}' /proc/$miner_pid/stat)
+              clk_tck=$(getconf CLK_TCK)
+              boot_time=$(awk '/btime/ {print $2}' /proc/stat)
+              start_time=$((boot_time + proc_start_ticks / clk_tck))
+              now=$(date +%s)
+              uptime_secs=$((now - start_time))
+              hours=$((uptime_secs / 3600))
+              minutes=$(((uptime_secs % 3600) / 60))
+              readable="${minutes}m"
+              ((hours > 0)) && readable="${hours}h ${minutes}m"
+            fi
+          fi
+
+          # Uptime coloring
+          if [[ "$readable" =~ ^([0-9]+)m$ ]]; then
+            diff=${BASH_REMATCH[1]}
+            diff=$((10#$diff))
+            if ((diff < 5)); then
+              icon="${YELLOW}🟡${RESET}"
+            elif ((diff < 30)); then
+              icon="${CYAN}🔵${RESET}"
+            else
+              icon="${GREEN}🟢${RESET}"
+            fi
+          elif [[ "$readable" =~ ^([0-9]+)h ]]; then
+            icon="${GREEN}🟢${RESET}"
+          else
+            icon="${YELLOW}🟡${RESET}"
+          fi
+
+          # CPU/mem/child
+          if [[ -z "$miner_pid" || ! "$miner_pid" =~ ^[0-9]+$ || "$miner_pid" -le 1 || ! -e "/proc/$miner_pid" ]]; then
+            cpu="--"
+            mem="--"
+          else
+            child_pid=""
+            for cpid in $(pgrep -P "$miner_pid"); do
+              cmdline=$(ps -p "$cpid" -o cmd=)
+              if [[ "$cmdline" == *"$NOCKCHAIN_BIN"* ]] || [[ "$cmdline" == *"/nockchain"* ]] || [[ "$cmdline" == *" nockchain"* ]]; then
+                child_pid="$cpid"
+                break
+              fi
+            done
+            if [[ -n "$child_pid" && -e "/proc/$child_pid" ]]; then
+              cpu_mem=$(ps -p "$child_pid" -o %cpu,%mem --no-headers)
+              cpu=$(echo "$cpu_mem" | awk '{print $1}')
+              mem=$(echo "$cpu_mem" | awk '{print $2}')
+            else
+              cpu="--"
+              mem="--"
+            fi
+          fi
+          if [[ -n "${child_pid:-}" && -e "/proc/$child_pid/status" ]]; then
+            mem_kb=$(awk '/VmRSS:/ {print $2}' "/proc/$child_pid/status")
+            mem_gb=$(awk "BEGIN { printf \"%.1f\", $mem_kb / 1024 / 1024 }")
+          else
+            mem_gb="--"
+          fi
+
+          if [[ -f "$log_file" ]]; then
+            latest_block=$(grep -a 'added to validated blocks at' "$log_file" 2>/dev/null | tail -n 1 | grep -oP 'at\s+\K([0-9]{1,3}(?:\.[0-9]{3})*)' || echo "--")
+          else
+            latest_block="--"
+          fi
+          if [[ -f "$log_file" ]]; then
+            last_line=$(tac "$log_file" | sed 's/\x1b\[[0-9;]*m//g' | grep -a 'connected_peers=' | grep -a 'connected_peers=[0-9]\+' | head -n 1 || echo "")
+            extracted=$(echo "$last_line" | sed -n 's/.*connected_peers=\([0-9]\+\).*/\1/p' || echo "")
+            if [[ "$extracted" =~ ^[0-9]+$ ]]; then
+              peer_count="$extracted"
+            fi
+          fi
+
+          lag="--"
+          lag_int=0
+          if [[ "$NETWORK_HEIGHT" =~ ^[0-9]+(\.[0-9]+)?$ && "$latest_block" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+            lag_val=$(awk "BEGIN { print $NETWORK_HEIGHT - $latest_block }")
+            lag_int=$(printf "%.0f" "$lag_val" 2>/dev/null)
+            [[ "$lag_int" =~ ^-?[0-9]+$ ]] || lag_int=0
+            ((lag_int < 0)) && lag_int=0
+            lag="$lag_int"
+          fi
+
+          # Status
+          if [[ -z "$mine_flag" ]]; then
+            status_raw="SYNC-ONLY"
+          elif [[ "$lag" =~ ^[0-9]+$ && "$lag_int" -eq 0 ]]; then
+            status_raw="MINING"
+          else
+            status_raw="SYNCING"
+          fi
         fi
-        for d in \$NOCKCHAIN_HOME/miner*; do
-          bash \"$SCRIPT_PATH\" --restart-miner \"\$d\" \"\$MINING_KEY_DISPLAY\"
-        done
-        echo 'Update and restart completed.'
-      } 2>&1 | tee \$NOCKCHAIN_HOME/nockupdate.log
-      exec bash
-    "
-    echo ""
-    echo -e "${GREEN}✅ Update and miner restart process started.${RESET}"
-    echo -e "${CYAN}📺 Screen session: ${DIM}nockupdate${RESET}"
-    echo ""
-    echo -e "${YELLOW}▶ To monitor progress:${RESET}"
-    echo -e "${DIM}   screen -r nockupdate${RESET}"
-    echo ""
-    echo -e "${YELLOW}▶ To exit the screen without stopping it:${RESET}"
-    echo -e "${DIM}   Press Ctrl+A then D${RESET}"
-    echo ""
 
-    echo -e "${YELLOW}Do you want to attach to the 'nockupdate' screen session now? (y/n)${RESET}"
-    while true; do
-      read -rp "$(echo -e "${BOLD_BLUE}> ${RESET}")" ATTACH_CHOICE
-      [[ "$ATTACH_CHOICE" =~ ^[YyNn]$ ]] && break
-      echo -e "${RED}❌ Please enter y or n.${RESET}"
+        # Miner name coloring
+        session_padded=$(printf "%-9s" "$session")
+        if [[ $is_active -eq 0 ]]; then
+          session_display="${RED}${session_padded}${RESET}"
+        else
+          session_display="${GREEN}${session_padded}${RESET}"
+        fi
+
+        # COLUMN FORMATTING
+        avg_blk="${avg_blk:0:9}"
+        avg_comp="${avg_comp:0:12}"
+        last_comp="${last_comp:0:12}"
+        last_blk="${last_blk:0:9}"
+        readable="${readable:0:9}"
+        cpu="${cpu:0:9}"
+        mem="${mem:0:9}"
+        mem_gb="${mem_gb:0:9}"
+        latest_block="${latest_block:0:9}"
+
+        [[ -z "$readable" ]] && readable="--"
+        [[ -z "$cpu" ]] && cpu="--"
+        [[ -z "$mem" ]] && mem="--"
+        [[ -z "$mem_gb" ]] && mem_gb="--"
+        [[ -z "$latest_block" ]] && latest_block="--"
+        [[ -z "$lag" ]] && lag="--"
+        [[ -z "$peer_count" ]] && peer_count="--"
+        [[ -z "$last_comp" ]] && last_comp="--"
+        [[ -z "$avg_comp" ]] && avg_comp="--"
+        [[ -z "$last_blk" ]] && last_blk="--"
+        [[ -z "$avg_blk" ]] && avg_blk="--"
+        [[ -z "$status_raw" ]] && status_raw="SYNCING"
+
+        uptime_padded=$(printf "%-9s" "$readable")
+        cpu_padded=$(printf "%-9s" "${cpu}%")
+        mem_padded=$(printf "%-9s" "${mem}%")
+        ram_padded=$(printf "%-9s" "$mem_gb")
+        block_padded=$(printf "%-9s" "$latest_block")
+        lag_padded=$(printf "%-5s" "$lag")
+        status_padded=$(printf "%-9s" "$status_raw")
+        peer_padded=$(printf "%-6s" "$peer_count")
+        last_comp_padded=$(printf "%-9s" "$last_comp")
+        avg_comp_padded=$(printf "%-9s" "$avg_comp")
+        blk_age_padded=$(printf "%-9s" "$last_blk")
+        avg_blk_padded=$(printf "%-9s" "$avg_blk")
+
+        uptime_display="${BOLD_BLUE}${uptime_padded}${RESET}"
+        if [[ "$cpu" =~ ^[0-9]+(\.[0-9]+)?$ ]] && (($(echo "$cpu <= 60" | bc -l))); then
+          cpu_display="${GREEN}${cpu_padded}${RESET}"
+        elif [[ "$cpu" =~ ^[0-9]+(\.[0-9]+)?$ ]] && (($(echo "$cpu <= 100" | bc -l))); then
+          cpu_display="${YELLOW}${cpu_padded}${RESET}"
+        elif [[ "$cpu" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+          cpu_display="${RED}${cpu_padded}${RESET}"
+        else
+          cpu_display="${cpu_padded}"
+        fi
+        if [[ "$mem" =~ ^[0-9]+(\.[0-9]+)?$ ]] && (($(echo "$mem <= 20" | bc -l))); then
+          mem_display="${CYAN}${mem_padded}${RESET}"
+        elif [[ "$mem" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+          mem_display="${MAGENTA}${mem_padded}${RESET}"
+        else
+          mem_display="${mem_padded}"
+        fi
+        ram_display="${DIM}${WHITE}${ram_padded}${RESET}"
+        block_display="${CYAN}${block_padded}${RESET}"
+        if [[ "$lag" =~ ^[0-9]+$ && "$lag" -gt 0 ]]; then
+          lag_display="${RED}${lag_padded}${RESET}"
+        else
+          lag_display="${GREEN}${lag_padded}${RESET}"
+        fi
+
+        # Status color
+        if [[ $is_active -eq 0 ]]; then
+          status_display="${RED}${status_padded}${RESET}"
+        elif [[ "$status_raw" == "MINING" ]]; then
+          status_display="${GREEN}${status_padded}${RESET}"
+        elif [[ "$status_raw" == "SYNC-ONLY" ]]; then
+          status_display="${CYAN}${status_padded}${RESET}"
+        else
+          status_display="${YELLOW}${status_padded}${RESET}"
+        fi
+
+        # Peer count color
+        peer_count_val="${peer_count:-0}"
+        if [[ "$peer_count_val" =~ ^[0-9]+$ ]]; then
+          if ((peer_count_val >= 32)); then
+            peer_display="${GREEN}${peer_padded}${RESET}"
+          elif ((peer_count_val >= 16)); then
+            peer_display="${YELLOW}${peer_padded}${RESET}"
+          else
+            peer_display="${RED}${peer_padded}${RESET}"
+          fi
+        else
+          peer_display="${RED}${peer_padded}${RESET}"
+        fi
+
+        # Prepare display variables for proof/block-age columns with 's' next to value, and pad for UI
+        last_comp_s=$(add_s "$last_comp")
+        avg_comp_s=$(add_s "$avg_comp")
+        blk_age_s=$(add_s "$last_blk")
+        avg_blk_s=$(add_s "$avg_blk")
+
+        last_comp_colored="${YELLOW}${last_comp_s}${RESET}"
+        avg_comp_colored="${BOLD_BLUE}${avg_comp_s}${RESET}"
+
+        if [[ "$last_blk" =~ ^[0-9]+(\.[0-9]+)?$ ]] && (($(echo "$last_blk >= 900" | bc -l))); then
+          blk_age_colored="${RED}${blk_age_s}${RESET}"
+        elif [[ "$last_blk" =~ ^[0-9]+(\.[0-9]+)?$ ]] && (($(echo "$last_blk >= 300" | bc -l))); then
+          blk_age_colored="${YELLOW}${blk_age_s}${RESET}"
+        else
+          blk_age_colored="${GREEN}${blk_age_s}${RESET}"
+        fi
+        avg_blk_colored="${DIM}${CYAN}${avg_blk_s}${RESET}"
+
+        # Pad all columns to fixed width
+        last_comp_display=$(pad_plain "$last_comp_colored" 9)
+        avg_comp_display=$(pad_plain "$avg_comp_colored" 9)
+        blk_age_display=$(pad_plain "$blk_age_colored" 9)
+        avg_blk_display=$(pad_plain "$avg_blk_colored" 9)
+
+        printf "%b | %b | %b | %b | %b | %b | %b | %b | %b | %b | %b | %b | %b | %b\n" \
+          "$icon" "$session_display" "$uptime_display" "$cpu_display" "$mem_display" "$ram_display" "$block_display" "$lag_display" "$status_display" "$peer_display" "$last_comp_display" "$avg_comp_display" "$blk_age_display" "$avg_blk_display"
+      done
+
+      echo ""
+      echo -e "${DIM}Refreshing every 2s — press ${BOLD_BLUE}Enter${DIM} to exit.${RESET}"
+      key=""
+      if read -t 2 -s -r key 2>/dev/null; then
+        [[ "$key" == "" ]] && break
+      fi
     done
-    if [[ "$ATTACH_CHOICE" =~ ^[Yy]$ ]]; then
-      screen -r nockupdate
-    fi
-
-    echo -e "${YELLOW}Press any key to return to the main menu...${RESET}"
-    read -n 1 -s
     continue
     ;;
-  3)
+
+  # ===== Main Menu Option 12 =====
+  12)
     clear
-    echo -e "${YELLOW}You are about to update only the Nockchain Wallet (nockchain-wallet).${RESET}"
-    confirm_yes_no "Continue?" || {
-      echo -e "${CYAN}Returning to menu...${RESET}"
+    miner_dirs=$(find "$NOCKCHAIN_HOME" -maxdepth 1 -type d -name "miner*" | sort -V)
+
+    if [[ -z "$miner_dirs" ]]; then
+      echo -e "${RED}❌ No miner directories found.${RESET}"
+      read -n 1 -s -r -p $'\nPress any key to return to menu...'
       continue
-    }
-
-    safe_kill_screen "walletupdate"
-
-    echo -e "${CYAN}>> Launching wallet update in screen session 'walletupdate'...${RESET}"
-    screen -dmS walletupdate bash -c "
-      source \"$SETTINGS_FILE\";
-      cd \$NOCKCHAIN_HOME && {
-        git pull && \
-        make install-nockchain-wallet && \
-        export PATH=\"\$HOME/.cargo/bin:\$PATH\" && \
-        echo 'Wallet update completed.'
-      } 2>&1 | tee \$NOCKCHAIN_HOME/walletupdate.log
-      exec bash
-    "
-    echo -e "${GREEN}✅ Wallet update started in screen session 'walletupdate'.${RESET}"
-    echo -e "${YELLOW}To monitor: ${DIM}screen -r walletupdate${RESET}"
-    echo -e "${CYAN}To exit screen: ${DIM}Ctrl+A then D${RESET}"
-
-    echo -e "${YELLOW}Do you want to attach to the 'walletupdate' screen session now? (y/n)${RESET}"
-    while true; do
-      read -rp "$(echo -e "${BOLD_BLUE}> ${RESET}")" ATTACH_WALLET
-      [[ "$ATTACH_WALLET" =~ ^[YyNn]$ ]] && break
-      echo -e "${RED}❌ Please enter y or n.${RESET}"
-    done
-    if [[ "$ATTACH_WALLET" =~ ^[Yy]$ ]]; then
-      screen -r walletupdate
     fi
 
-    echo -e "${YELLOW}Press any key to return to the main menu...${RESET}"
-    read -n 1 -s
+    if ! command -v fzf &>/dev/null; then
+      echo -e "${YELLOW}fzf not found. Installing fzf...${RESET}"
+      sudo apt-get update && sudo apt-get install -y fzf
+      echo -e "${GREEN}fzf installed successfully.${RESET}"
+    fi
+
+    # fzf-based miner log menu with status indicators and formatting
+    declare -a menu_entries=()
+    declare -A miner_logs
+
+    # Collect miner info into array of lines: "miner_id|log_path|status"
+    miner_info_lines=()
+    for dir in $miner_dirs; do
+      miner_name=$(basename "$dir" | sed -nE 's/^(miner[0-9]+)$/\1/p')
+      [[ -z "$miner_name" ]] && continue
+      log_path="$dir/${miner_name}.log"
+      service_name="nockchain-$miner_name"
+      if systemctl is-active --quiet "$service_name"; then
+        status_icon="🟢"
+      else
+        status_icon="🔴"
+      fi
+      miner_info_lines+=("$miner_name|$log_path|$status_icon")
+      miner_logs["$miner_name"]="$log_path"
+    done
+
+    # Sort by miner number
+    IFS=$'\n' sorted_info=($(printf "%s\n" "${miner_info_lines[@]}" | sort -t'|' -k1,1n))
+    unset IFS
+
+    # Build menu entries with formatting
+    for info in "${sorted_info[@]}"; do
+      miner_id=$(echo "$info" | cut -d'|' -f1)
+      log_path=$(echo "$info" | cut -d'|' -f2)
+      status_icon=$(echo "$info" | cut -d'|' -f3)
+      label="$(printf "%s %b%-8s%b %b[%s]%b" "$status_icon" "${BOLD_BLUE}" "$miner_id" "${RESET}" "${DIM}" "$log_path" "${RESET}")"
+      menu_entries+=("$label")
+    done
+
+    # Add Show all at the top and Cancel directly after, then the miners
+    menu_entries=("📡 Show all miner logs combined (live)" "↩️  Cancel and return to menu" "${menu_entries[@]}")
+
+    selected=$(printf "%s\n" "${menu_entries[@]}" | fzf --ansi --prompt="Select miner: " \
+      --pointer="👉" --marker="✓" \
+      --color=prompt:blue,fg+:cyan,bg+:238,pointer:green,marker:green \
+      --header=$'\nUse ↑ ↓ arrows or type to search. ENTER to confirm.\n')
+    plain_selected=$(echo -e "$selected" | sed 's/\x1b\[[0-9;]*m//g')
+
+    if [[ "$plain_selected" == *"Show all miner logs"* ]]; then
+      echo -e "${CYAN}Streaming combined logs from all miners...${RESET}"
+      echo -e "${DIM}Press Ctrl+C to return to menu.${RESET}"
+      temp_log_script=$(mktemp)
+      cat >"$temp_log_script" <<'EOL'
+#!/bin/bash
+source "$HOME/.nockchain_launcher.conf"
+trap "exit 0" INT
+tail -f $(find "$NOCKCHAIN_HOME" -maxdepth 1 -type d -name "miner*" -exec bash -c '
+  for d; do 
+    f="$d/$(basename "$d").log"
+    [[ -f "$f" ]] && echo "$f"
+  done
+' _ {} +)
+EOL
+      chmod +x "$temp_log_script"
+      bash "$temp_log_script"
+      echo -e "${YELLOW}Log stream ended. Press any key to return to the main menu...${RESET}"
+      read -n 1 -s
+      rm -f "$temp_log_script"
+      continue
+    fi
+
+    selected_miner=$(echo "$plain_selected" | sed -nE 's/.*(miner[0-9]+).*/\1/p')
+    [[ ! "$selected_miner" =~ ^miner[0-9]+$ ]] && {
+      echo -e "${RED}❌ Invalid selection. No miner selected.${RESET}"
+      read -n 1 -s
+      continue
+    }
+    selected_miner=$(echo "$selected_miner" | tr -d '\n\r')
+
+    if [[ -z "$selected" || "$selected" == *"Cancel and return to menu"* ]]; then
+      echo -e "${YELLOW}Returning to menu...${RESET}"
+      continue
+    fi
+
+    # Extract miner name from selection (match e.g. "minerX")
+    miner_log=""
+    [[ -z "$selected_miner" || -z "${miner_logs[$selected_miner]:-}" ]] && {
+      echo -e "${RED}❌ Invalid selection. No log file found for: $selected_miner${RESET}"
+      read -n 1 -s -r -p $'\nPress any key to return to menu...'
+      continue
+    }
+    miner_log="${miner_logs[$selected_miner]}"
+
+    if [[ ! -f "$miner_log" ]]; then
+      echo -e "${RED}❌ Log file not found: ${DIM}${miner_log}${RESET}"
+      read -n 1 -s -r -p $'\nPress any key to return to menu...'
+      continue
+    fi
+    echo -e "${CYAN}Streaming logs for $selected_miner...${RESET}"
+    echo -e "${DIM}Press Ctrl+C to return to menu.${RESET}"
+    temp_log_script=$(mktemp)
+    cat >"$temp_log_script" <<EOL
+#!/bin/bash
+source "$HOME/.nockchain_launcher.conf"
+trap "echo -e '\n${YELLOW}Log stream ended. Press any key to return to the main menu...${RESET}'; read -n 1 -s; exit 0" INT
+tail -f "$miner_log"
+EOL
+    chmod +x "$temp_log_script"
+    bash "$temp_log_script"
+    rm -f "$temp_log_script"
     continue
     ;;
-  4)
-    clear
-    echo -e "${YELLOW}You are about to update the launcher script to the latest version from GitHub.${RESET}"
-    confirm_yes_no "Continue?" || {
-      echo -e "${CYAN}Returning to menu...${RESET}"
-      continue
-    }
 
-    SCRIPT_PATH="$(realpath "$0")"
-    TEMP_PATH="/tmp/nockchain_launcher.sh"
-    TEMP_VERSION="/tmp/NOCKCHAIN_LAUNCHER_VERSION"
-
-    echo -e "${CYAN}>> Downloading latest launcher script...${RESET}"
-    if ! curl -fsSL https://raw.githubusercontent.com/jobless0x/nockchain-launcher/main/nockchain_launcher.sh -o "$TEMP_PATH"; then
-      echo -e "${RED}❌ Failed to download the launcher script.${RESET}"
-      continue
-    fi
-
-    echo -e "${CYAN}>> Downloading version file...${RESET}"
-    if ! curl -fsSL https://raw.githubusercontent.com/jobless0x/nockchain-launcher/main/NOCKCHAIN_LAUNCHER_VERSION -o "$TEMP_VERSION"; then
-      echo -e "${RED}❌ Failed to download the version file.${RESET}"
-      continue
-    fi
-
-    echo -e "${CYAN}>> Replacing launcher and version file...${RESET}"
-    cp "$TEMP_PATH" "$SCRIPT_PATH"
-    cp "$TEMP_VERSION" "$LAUNCHER_VERSION_FILE"
-    chmod +x "$SCRIPT_PATH"
-
-    echo -e "${GREEN}✅ Launcher updated successfully.${RESET}"
-    echo -e "${YELLOW}Press any key to restart the launcher with the updated version...${RESET}"
-    read -n 1 -s
-    exec "$SCRIPT_PATH"
-    ;;
+  # ===== Main Menu Option 13 =====
   13)
     clear
     require_nockchain || continue
@@ -1793,11 +2171,11 @@ EOS
     fi
 
     # Prompt for use of existing config if present
-    if [[ -f "$CONFIG_FILE" ]]; then
+    if [[ -f "$LAUNCH_CFG" ]]; then
       echo ""
       echo -e "${BOLD_BLUE}${CYAN}⚙️  Miner Configuration${RESET}"
       echo -e "${DIM}──────────────────────────────────────────────${RESET}"
-      cat "$CONFIG_FILE"
+      cat "$LAUNCH_CFG"
       echo -e "${DIM}──────────────────────────────────────────────${RESET}"
       echo ""
       echo -e "${YELLOW}Do you want to keep this existing configuration?${RESET}"
@@ -1812,14 +2190,14 @@ EOS
       done
       if [[ "$USE_EXISTING_CFG" == "1" ]]; then
         # Automatically count number of miners in existing config
-        NUM_MINERS=$(grep -c '^\[miner[0-9]\+\]' "$CONFIG_FILE")
+        NUM_MINERS=$(grep -c '^\[miner[0-9]\+\]' "$LAUNCH_CFG")
         echo ""
         echo -e "${GREEN}✅ Using existing configuration.${RESET}"
         echo ""
         echo -e "${BOLD_BLUE}${CYAN}🔧 Launch Preview${RESET}"
         printf "  ${CYAN}%-10s %-22s %-22s${RESET}\n" "Miner" "Systemd Service" "Run Command"
         for i in $(seq 1 "$NUM_MINERS"); do
-          MINER_DIR="$NCK_DIR/miner$i"
+          MINER_DIR="$NOCKCHAIN_HOME/miner$i"
           SERVICE="nockchain-miner$i.service"
           RUN_CMD="cd $MINER_DIR && exec run_miner.sh $i"
           printf "  ${BOLD_BLUE}%-10s${RESET} %-22s %-22s\n" "miner$i" "$SERVICE" "$RUN_CMD"
@@ -1836,7 +2214,7 @@ EOS
           echo ""
           echo -e "${GREEN}Proceeding with miner launch...${RESET}"
           for i in $(seq 1 "$NUM_MINERS"); do
-            MINER_DIR="$NCK_DIR/miner$i"
+            MINER_DIR="$NOCKCHAIN_HOME/miner$i"
             mkdir -p "$MINER_DIR"
             generate_systemd_service $i
             start_miner_service $i
@@ -1861,7 +2239,7 @@ EOS
       else
         echo ""
         echo -e "${YELLOW}⚠️ Discarding existing configuration...${RESET}"
-        rm -f "$CONFIG_FILE"
+        rm -f "$LAUNCH_CFG"
         echo ""
       fi
     fi
@@ -2118,7 +2496,7 @@ EOS
             fi
             echo "STATE_FLAG=--state-jam ../state.jam"
           done
-        } >"$CONFIG_FILE"
+        } >"$LAUNCH_CFG"
         echo ""
         # Show the miners to be launched
         echo -e ""
@@ -2147,10 +2525,10 @@ EOS
         }
         echo -e "${GREEN}Proceeding with miner launch...${RESET}"
         echo ""
-        echo -e "${GREEN}📁 Configuration saved to: $CONFIG_FILE${RESET}"
+        echo -e "${GREEN}📁 Configuration saved to: $LAUNCH_CFG${RESET}"
         echo -e "${CYAN}🧠 Managed by: launch.cfg (edit this file to change peer mode, state file, or flags)${RESET}"
         for i in $(seq 1 "$NUM_MINERS"); do
-          MINER_DIR="$NCK_DIR/miner$i"
+          MINER_DIR="$NOCKCHAIN_HOME/miner$i"
           mkdir -p "$MINER_DIR"
           generate_systemd_service $i
           start_miner_service $i
@@ -2173,6 +2551,8 @@ EOS
     done
     continue
     ;;
+
+  # ===== Main Menu Option 14 =====
   14)
     clear
     require_nockchain || continue
@@ -2259,6 +2639,8 @@ EOS
     continue
 
     ;;
+
+  # ===== Main Menu Option 15 =====
   15)
     clear
     ensure_fzf_installed
@@ -2350,354 +2732,116 @@ EOS
     read -n 1 -s
     continue
     ;;
-  11)
+
+  # ===== Main Menu Option 21 =====
+  21)
     clear
-    # Check for miner directories before proceeding to live monitor
-    miner_dirs=$(find "$NOCKCHAIN_HOME" -maxdepth 1 -type d -name "miner[0-9]*" 2>/dev/null)
-    if [[ -z "$miner_dirs" ]]; then
-      echo -e "${YELLOW}No miners found. Nothing to monitor.${RESET}"
-      read -n 1 -s -r -p $'\nPress any key to return to the main menu...'
-      continue
-    fi
-    # Calculate total system memory in GB for MEM % -> GB conversion (outside the loop, only once)
-    TOTAL_MEM_KB=$(grep MemTotal /proc/meminfo | awk '{print $2}')
-    TOTAL_MEM_GB=$(awk "BEGIN { printf \"%.1f\", $TOTAL_MEM_KB/1024/1024 }")
-    while true; do
-      # Extract network height from all miner logs (live, every refresh)
-      NETWORK_HEIGHT="--"
-      all_blocks=()
-      for miner_dir in "$NOCKCHAIN_HOME"/miner[0-9]*; do
-        [[ -d "$miner_dir" ]] || continue
-        miner_label=$(basename "$miner_dir" | sed -nE 's/^(miner[0-9]+)$/\1/p')
-        [[ -z "$miner_label" ]] && continue
-        log_file="$miner_dir/${miner_label}.log"
-        height=""
-        if [[ -f "$log_file" && -r "$log_file" ]]; then
-          heard_block=$(grep -a 'heard block' "$log_file" | tail -n 5 | grep -oP 'height\s+\K([0-9]{1,3}(?:\.[0-9]{3})*)' || true)
-          validated_block=$(grep -a 'added to validated blocks at' "$log_file" | tail -n 5 | grep -oP 'at\s+\K([0-9]{1,3}(?:\.[0-9]{3})*)' || true)
-          combined=$(printf "%s\n%s\n" "$heard_block" "$validated_block" | sort -V | tail -n 1)
-          if [[ -n "$combined" ]]; then
-            all_blocks+=("$combined")
-          fi
-        fi
-      done
-      if [[ ${#all_blocks[@]} -gt 0 ]]; then
-        NETWORK_HEIGHT=$(printf "%s\n" "${all_blocks[@]}" | sort -V | tail -n 1)
-      fi
+    echo -e "${CYAN}System Diagnostics${RESET}"
+    echo ""
 
-      # Display latest state.jam export block and next save using get_latest_statejam_block
-      read statejam_blk statejam_mins < <(get_latest_statejam_block | tr '|' ' ')
-      blk_disp="${statejam_blk:---}"
-      min_disp="${statejam_mins:---}"
-
-      tput cup 0 0
-      echo -e "${DIM}🖥️  Live Miner Monitor ${RESET}"
-      echo ""
-      echo -e "${CYAN}📡 Network height: ${RESET}$NETWORK_HEIGHT  |  ${CYAN}Saved state.jam: ${RESET}$blk_disp${DIM}  |  Next save in ${RESET}${YELLOW}${min_disp}${RESET}${DIM}m${RESET}"
-      echo ""
-      printf "   | %-9s | %-9s | %-9s | %-9s | %-9s | %-9s | %-5s | %-9s | %-6s | %-9s | %-9s | %-9s | %-9s\n" \
-        "Miner" "Uptime" "CPU" "MEM" "RAM (GB)" "Block" "Lag" "Status" "Peers" "LastProof" "AvgProof" "BlkAge" "AvgBlk"
-
-      all_miners=()
-      for miner_dir in "$NOCKCHAIN_HOME"/miner[0-9]*; do
-        [ -d "$miner_dir" ] || continue
-        all_miners+=("$(basename "$miner_dir")")
-      done
-      IFS=$'\n' sorted_miners=($(printf "%s\n" "${all_miners[@]}" | sort -V))
-      unset IFS
-      if [[ ${#sorted_miners[@]} -eq 0 ]]; then
-        echo -e "${YELLOW}No miners found or unable to read data.${RESET}"
-        echo -e "${YELLOW}Press Enter to return to menu...${RESET}"
-        read
-        break
-      fi
-
-      # Color variables for peer display
-      CYAN="\033[36m"
-      BOLD_BLUE="\033[1;34m"
-      DIM="\033[2m"
-      MAGENTA="\033[35m"
-      WHITE="\033[97m"
-      RED="\033[31m"
-      GREEN="\033[32m"
-      YELLOW="\033[33m"
-      RESET="\033[0m"
-
-      for session in "${sorted_miners[@]}"; do
-        session=$(echo "$session" | sed -nE 's/^(miner[0-9]+)$/\1/p')
-        [[ -z "$session" ]] && continue
-        miner_dir="$NOCKCHAIN_HOME/$session"
-        log_file="$miner_dir/${session}.log"
-
-        # --- INITIALIZE all variables ---
-        lag="--"
-        lag_int=0
-        is_active=0
-        icon="${DIM}${RED}❌${RESET}"
-        readable="--"
-        cpu="--"
-        mem="--"
-        mem_gb="--"
-        latest_block="--"
-        peer_count="--"
-        last_comp="--"
-        avg_comp="--"
-        last_blk="--"
-        avg_blk="--"
-        status_raw="INACTIVE"
-
-        mine_flag=$(awk -v section="[$session]" '
-          $0 == section {found=1; next}
-          /^\[.*\]/ {found=0}
-          found && /^MINE_FLAG=/ {sub(/^MINE_FLAG=/, ""); print; exit}
-        ' "$CONFIG_FILE")
-
-        # --- Populate values ---
-        proof_metrics=$(update_proof_durations "$session")
-        IFS='|' read -r last_comp avg_comp <<<"$proof_metrics"
-        last_comp=${last_comp:-"--"}
-        avg_comp=${avg_comp:-"--"}
-
-        block_metrics=$(get_block_deltas "$session")
-        IFS='|' read -r last_blk avg_blk <<<"$block_metrics"
-        last_blk=${last_blk:-"--"}
-        avg_blk=${avg_blk:-"--"}
-
-        avg_blk=$(echo "$avg_blk" | tr -d '\n\r')
-        [[ -z "$avg_blk" ]] && avg_blk="--"
-
-        if systemctl is-active --quiet nockchain-$session 2>/dev/null; then
-          is_active=1
-          icon="${GREEN}🟢${RESET}"
-
-          miner_pid=$(systemctl show -p MainPID --value nockchain-$session)
-          # Uptime
-          if [[ -n "${miner_pid:-}" && "$miner_pid" =~ ^[0-9]+$ ]]; then
-            if [[ "$miner_pid" -gt 1 && -r "/proc/$miner_pid/stat" ]]; then
-              proc_start_ticks=$(awk '{print $22}' /proc/$miner_pid/stat)
-              clk_tck=$(getconf CLK_TCK)
-              boot_time=$(awk '/btime/ {print $2}' /proc/stat)
-              start_time=$((boot_time + proc_start_ticks / clk_tck))
-              now=$(date +%s)
-              uptime_secs=$((now - start_time))
-              hours=$((uptime_secs / 3600))
-              minutes=$(((uptime_secs % 3600) / 60))
-              readable="${minutes}m"
-              ((hours > 0)) && readable="${hours}h ${minutes}m"
-            fi
-          fi
-
-          # Uptime coloring (for icon, not name)
-          if [[ "$readable" =~ ^([0-9]+)m$ ]]; then
-            diff=${BASH_REMATCH[1]}
-            diff=$((10#$diff))
-            if ((diff < 5)); then
-              icon="${YELLOW}🟡${RESET}"
-            elif ((diff < 30)); then
-              icon="${CYAN}🔵${RESET}"
-            else
-              icon="${GREEN}🟢${RESET}"
-            fi
-          elif [[ "$readable" =~ ^([0-9]+)h ]]; then
-            icon="${GREEN}🟢${RESET}"
-          else
-            icon="${YELLOW}🟡${RESET}"
-          fi
-
-          # CPU/mem/child
-          if [[ -z "$miner_pid" || ! "$miner_pid" =~ ^[0-9]+$ || "$miner_pid" -le 1 || ! -e "/proc/$miner_pid" ]]; then
-            cpu="--"
-            mem="--"
-          else
-            child_pid=""
-            for cpid in $(pgrep -P "$miner_pid"); do
-              cmdline=$(ps -p "$cpid" -o cmd=)
-              if [[ "$cmdline" == *"$NOCKCHAIN_BIN"* ]] || [[ "$cmdline" == *"/nockchain"* ]] || [[ "$cmdline" == *" nockchain"* ]]; then
-                child_pid="$cpid"
-                break
-              fi
-            done
-            if [[ -n "$child_pid" && -e "/proc/$child_pid" ]]; then
-              cpu_mem=$(ps -p "$child_pid" -o %cpu,%mem --no-headers)
-              cpu=$(echo "$cpu_mem" | awk '{print $1}')
-              mem=$(echo "$cpu_mem" | awk '{print $2}')
-            else
-              cpu="--"
-              mem="--"
-            fi
-          fi
-          if [[ -n "${child_pid:-}" && -e "/proc/$child_pid/status" ]]; then
-            mem_kb=$(awk '/VmRSS:/ {print $2}' "/proc/$child_pid/status")
-            mem_gb=$(awk "BEGIN { printf \"%.1f\", $mem_kb / 1024 / 1024 }")
-          else
-            mem_gb="--"
-          fi
-
-          if [[ -f "$log_file" ]]; then
-            latest_block=$(grep -a 'added to validated blocks at' "$log_file" 2>/dev/null | tail -n 1 | grep -oP 'at\s+\K([0-9]{1,3}(?:\.[0-9]{3})*)' || echo "--")
-          else
-            latest_block="--"
-          fi
-          if [[ -f "$log_file" ]]; then
-            last_line=$(tac "$log_file" | sed 's/\x1b\[[0-9;]*m//g' | grep -a 'connected_peers=' | grep -a 'connected_peers=[0-9]\+' | head -n 1 || echo "")
-            extracted=$(echo "$last_line" | sed -n 's/.*connected_peers=\([0-9]\+\).*/\1/p' || echo "")
-            if [[ "$extracted" =~ ^[0-9]+$ ]]; then
-              peer_count="$extracted"
-            fi
-          fi
-
-          lag="--"
-          lag_int=0
-          if [[ "$NETWORK_HEIGHT" =~ ^[0-9]+(\.[0-9]+)?$ && "$latest_block" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
-            lag_val=$(awk "BEGIN { print $NETWORK_HEIGHT - $latest_block }")
-            lag_int=$(printf "%.0f" "$lag_val" 2>/dev/null)
-            [[ "$lag_int" =~ ^-?[0-9]+$ ]] || lag_int=0
-            ((lag_int < 0)) && lag_int=0
-            lag="$lag_int"
-          fi
-
-          # Status
-          if [[ -z "$mine_flag" ]]; then
-            status_raw="SYNC-ONLY"
-          elif [[ "$lag" =~ ^[0-9]+$ && "$lag_int" -eq 0 ]]; then
-            status_raw="MINING"
-          else
-            status_raw="SYNCING"
-          fi
-        fi # end active
-
-        # Miner name coloring
-        session_padded=$(printf "%-9s" "$session")
-        if [[ $is_active -eq 0 ]]; then
-          session_display="${RED}${session_padded}${RESET}"
-        else
-          session_display="${GREEN}${session_padded}${RESET}"
-        fi
-
-        # --- BULLETPROOF COLUMN FORMATTING ---
-        avg_blk="${avg_blk:0:9}"
-        avg_comp="${avg_comp:0:12}"
-        last_comp="${last_comp:0:12}"
-        last_blk="${last_blk:0:9}"
-        readable="${readable:0:9}"
-        cpu="${cpu:0:9}"
-        mem="${mem:0:9}"
-        mem_gb="${mem_gb:0:9}"
-        latest_block="${latest_block:0:9}"
-
-        [[ -z "$readable" ]] && readable="--"
-        [[ -z "$cpu" ]] && cpu="--"
-        [[ -z "$mem" ]] && mem="--"
-        [[ -z "$mem_gb" ]] && mem_gb="--"
-        [[ -z "$latest_block" ]] && latest_block="--"
-        [[ -z "$lag" ]] && lag="--"
-        [[ -z "$peer_count" ]] && peer_count="--"
-        [[ -z "$last_comp" ]] && last_comp="--"
-        [[ -z "$avg_comp" ]] && avg_comp="--"
-        [[ -z "$last_blk" ]] && last_blk="--"
-        [[ -z "$avg_blk" ]] && avg_blk="--"
-        [[ -z "$status_raw" ]] && status_raw="SYNCING"
-
-        uptime_padded=$(printf "%-9s" "$readable")
-        cpu_padded=$(printf "%-9s" "${cpu}%")
-        mem_padded=$(printf "%-9s" "${mem}%")
-        ram_padded=$(printf "%-9s" "$mem_gb")
-        block_padded=$(printf "%-9s" "$latest_block")
-        lag_padded=$(printf "%-5s" "$lag")
-        status_padded=$(printf "%-9s" "$status_raw")
-        peer_padded=$(printf "%-6s" "$peer_count")
-        last_comp_padded=$(printf "%-9s" "$last_comp")
-        avg_comp_padded=$(printf "%-9s" "$avg_comp")
-        blk_age_padded=$(printf "%-9s" "$last_blk")
-        avg_blk_padded=$(printf "%-9s" "$avg_blk")
-
-        uptime_display="${BOLD_BLUE}${uptime_padded}${RESET}"
-        if [[ "$cpu" =~ ^[0-9]+(\.[0-9]+)?$ ]] && (($(echo "$cpu <= 60" | bc -l))); then
-          cpu_display="${GREEN}${cpu_padded}${RESET}"
-        elif [[ "$cpu" =~ ^[0-9]+(\.[0-9]+)?$ ]] && (($(echo "$cpu <= 100" | bc -l))); then
-          cpu_display="${YELLOW}${cpu_padded}${RESET}"
-        elif [[ "$cpu" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
-          cpu_display="${RED}${cpu_padded}${RESET}"
-        else
-          cpu_display="${cpu_padded}"
-        fi
-        if [[ "$mem" =~ ^[0-9]+(\.[0-9]+)?$ ]] && (($(echo "$mem <= 20" | bc -l))); then
-          mem_display="${CYAN}${mem_padded}${RESET}"
-        elif [[ "$mem" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
-          mem_display="${MAGENTA}${mem_padded}${RESET}"
-        else
-          mem_display="${mem_padded}"
-        fi
-        ram_display="${DIM}${WHITE}${ram_padded}${RESET}"
-        block_display="${CYAN}${block_padded}${RESET}"
-        if [[ "$lag" =~ ^[0-9]+$ && "$lag" -gt 0 ]]; then
-          lag_display="${RED}${lag_padded}${RESET}"
-        else
-          lag_display="${GREEN}${lag_padded}${RESET}"
-        fi
-
-        # Status color
-        if [[ $is_active -eq 0 ]]; then
-          status_display="${RED}${status_padded}${RESET}"
-        elif [[ "$status_raw" == "MINING" ]]; then
-          status_display="${GREEN}${status_padded}${RESET}"
-        elif [[ "$status_raw" == "SYNC-ONLY" ]]; then
-          status_display="${CYAN}${status_padded}${RESET}"
-        else
-          status_display="${YELLOW}${status_padded}${RESET}"
-        fi
-
-        # Peer count color
-        peer_count_val="${peer_count:-0}"
-        if [[ "$peer_count_val" =~ ^[0-9]+$ ]]; then
-          if ((peer_count_val >= 32)); then
-            peer_display="${GREEN}${peer_padded}${RESET}"
-          elif ((peer_count_val >= 16)); then
-            peer_display="${YELLOW}${peer_padded}${RESET}"
-          else
-            peer_display="${RED}${peer_padded}${RESET}"
-          fi
-        else
-          peer_display="${RED}${peer_padded}${RESET}"
-        fi
-
-        # Prepare display variables for proof/block-age columns with 's' next to value, and pad for UI
-        last_comp_s=$(add_s "$last_comp")
-        avg_comp_s=$(add_s "$avg_comp")
-        blk_age_s=$(add_s "$last_blk")
-        avg_blk_s=$(add_s "$avg_blk")
-
-        last_comp_colored="${YELLOW}${last_comp_s}${RESET}"
-        avg_comp_colored="${BOLD_BLUE}${avg_comp_s}${RESET}"
-
-        if [[ "$last_blk" =~ ^[0-9]+(\.[0-9]+)?$ ]] && (($(echo "$last_blk >= 900" | bc -l))); then
-          blk_age_colored="${RED}${blk_age_s}${RESET}"
-        elif [[ "$last_blk" =~ ^[0-9]+(\.[0-9]+)?$ ]] && (($(echo "$last_blk >= 300" | bc -l))); then
-          blk_age_colored="${YELLOW}${blk_age_s}${RESET}"
-        else
-          blk_age_colored="${GREEN}${blk_age_s}${RESET}"
-        fi
-        avg_blk_colored="${DIM}${CYAN}${avg_blk_s}${RESET}"
-
-        # Pad all columns to fixed width
-        last_comp_display=$(pad_plain "$last_comp_colored" 9)
-        avg_comp_display=$(pad_plain "$avg_comp_colored" 9)
-        blk_age_display=$(pad_plain "$blk_age_colored" 9)
-        avg_blk_display=$(pad_plain "$avg_blk_colored" 9)
-
-        printf "%b | %b | %b | %b | %b | %b | %b | %b | %b | %b | %b | %b | %b | %b\n" \
-          "$icon" "$session_display" "$uptime_display" "$cpu_display" "$mem_display" "$ram_display" "$block_display" "$lag_display" "$status_display" "$peer_display" "$last_comp_display" "$avg_comp_display" "$blk_age_display" "$avg_blk_display"
-      done
-
-      echo ""
-      echo -e "${DIM}Refreshing every 2s — press ${BOLD_BLUE}Enter${DIM} to exit.${RESET}"
-      key=""
-      if read -t 2 -s -r key 2>/dev/null; then
-        [[ "$key" == "" ]] && break # Enter pressed
+    # Diagnostics: Verify required tools are installed
+    echo -e "${CYAN}▶ Required Commands${RESET}"
+    echo -e "${DIM}-------------------${RESET}"
+    for cmd in tmux screen cargo git curl make; do
+      if command -v "$cmd" &>/dev/null; then
+        echo -e "${GREEN}✔ $cmd found${RESET}"
+      else
+        echo -e "${RED}❌ $cmd missing${RESET}"
       fi
     done
+    echo ""
+
+    # Diagnostics: Check for Nockchain and wallet binary presence
+    echo -e "${CYAN}▶ Key Paths & Binaries${RESET}"
+    echo -e "${DIM}----------------------${RESET}"
+    [[ -x "$NOCKCHAIN_BIN" ]] && echo -e "${GREEN}✔ nockchain binary present${RESET}" || echo -e "${RED}❌ nockchain binary missing${RESET}"
+    [[ -x "$HOME/.cargo/bin/nockchain-wallet" ]] && echo -e "${GREEN}✔ nockchain-wallet present${RESET}" || echo -e "${RED}❌ nockchain-wallet missing${RESET}"
+    echo ""
+
+    # Diagnostics: Validate .env presence and mining key definition
+    echo -e "${CYAN}▶ .env & MINING_PUBKEY${RESET}"
+    echo -e "${DIM}-----------------------${RESET}"
+    if [[ -f "$NOCKCHAIN_HOME/.env" ]]; then
+      echo -e "${GREEN}✔ .env file found${RESET}"
+      if grep -q "^MINING_PUBKEY=" "$NOCKCHAIN_HOME/.env"; then
+        echo -e "${GREEN}✔ MINING_PUBKEY is defined${RESET}"
+      else
+        echo -e "${RED}❌ MINING_PUBKEY not found in .env${RESET}"
+      fi
+    else
+      echo -e "${RED}❌ .env file is missing${RESET}"
+    fi
+    echo ""
+
+    # Diagnostics: Count miner directories in local nockchain path
+    echo -e "${CYAN}▶ Miner Folders${RESET}"
+    echo -e "${DIM}--------------${RESET}"
+    miner_count=$(find "$NOCKCHAIN_HOME" -maxdepth 1 -type d -name "miner[0-9]*" 2>/dev/null | wc -l)
+    if ((miner_count > 0)); then
+      echo -e "${GREEN}✔ $miner_count miner folder(s) found${RESET}"
+    else
+      echo -e "${RED}❌ No miner folders found${RESET}"
+    fi
+    echo ""
+
+    # Diagnostics: Compare local vs remote git commit hash
+    echo -e "${CYAN}▶ Nockchain Repository${RESET}"
+    echo -e "${DIM}----------------------${RESET}"
+    if [[ ! -d "$NOCKCHAIN_HOME" ]]; then
+      echo -e "${YELLOW}Nockchain is not installed yet.${RESET}"
+    elif [[ ! -d "$NOCKCHAIN_HOME/.git" ]]; then
+      echo -e "${YELLOW}Nockchain exists but is not a Git repository.${RESET}"
+    elif git -C "$NOCKCHAIN_HOME" rev-parse &>/dev/null; then
+      BRANCH=$(git -C "$NOCKCHAIN_HOME" rev-parse --abbrev-ref HEAD)
+      REMOTE_URL=$(git -C "$NOCKCHAIN_HOME" config --get remote.origin.url)
+      LOCAL_HASH=$(git -C "$NOCKCHAIN_HOME" rev-parse "$BRANCH")
+      REMOTE_HASH=$(git -C "$NOCKCHAIN_HOME" ls-remote origin "refs/heads/$BRANCH" | awk '{print $1}')
+
+      printf "${GREEN}✔ %-15s${CYAN}%s${RESET}\n" "Remote URL:" "$REMOTE_URL"
+      printf "${GREEN}✔ %-15s${BOLD_BLUE}%s${RESET}\n" "Branch:" "$BRANCH"
+
+      if [[ "$LOCAL_HASH" != "$REMOTE_HASH" ]]; then
+        printf "${RED}❌ %-15s%s${RESET}\n" "Status:" "Update available"
+      else
+        printf "${GREEN}✔ %-15s%s\n" "Status:" "Repo is up to date with remote."
+      fi
+    else
+      echo -e "${RED}❌ Git repo appears broken${RESET}"
+    fi
+    echo ""
+
+    # Diagnostics: Verify internet access to GitHub
+    echo -e "${CYAN}▶ Internet Check${RESET}"
+    echo -e "${DIM}-----------------${RESET}"
+    if curl -fsSL https://github.com >/dev/null 2>&1; then
+      echo -e "${GREEN}✔ GitHub is reachable${RESET}"
+    else
+      echo -e "${RED}❌ Cannot reach GitHub${RESET}"
+    fi
+
+    echo ""
+    # Diagnostics: Check launcher version sync against GitHub
+    echo -e "${CYAN}▶ Launcher Update Check${RESET}"
+    echo -e "${DIM}-----------------------${RESET}"
+    printf "${GREEN}✔ %-15s${BOLD_BLUE}%s${RESET}\n" "Local:" "$LAUNCHER_VERSION"
+    if [[ -z "$REMOTE_VERSION" ]]; then
+      printf "${YELLOW}⚠ %-15s%s${RESET}\n" "Remote:" "Unavailable (offline or fetch error)"
+    else
+      printf "${GREEN}✔ %-15s${CYAN}%s${RESET}\n" "Remote:" "$REMOTE_VERSION"
+      if [[ "$LAUNCHER_VERSION" == "$REMOTE_VERSION" ]]; then
+        printf "${GREEN}✔ %-15s%s\n" "Status:" "Up to date"
+      else
+        printf "${RED}❌ %-15s%s${RESET}\n" "Status:" "Update available"
+      fi
+    fi
+    echo ""
+
+    echo -e "${YELLOW}Press any key to return to the main menu...${RESET}"
+    read -n 1 -s
     continue
     ;;
+
+  # ===== Main Menu Option 22 =====
   22)
     clear
     if ! command -v htop &>/dev/null; then
@@ -2709,128 +2853,308 @@ EOS
     continue
     ;;
 
-  12)
+  # ===== Main Menu Option 23 =====
+  23)
     clear
-    miner_dirs=$(find "$NOCKCHAIN_HOME" -maxdepth 1 -type d -name "miner*" | sort -V)
+    while true; do
+      echo -e "${CYAN}Edit Launcher Settings${RESET}"
+      echo ""
+      echo -e "${YELLOW}Current settings:${RESET}"
+      echo -e "  NOCKCHAIN_USER: ${GREEN}$NOCKCHAIN_USER${RESET}"
+      echo -e "  NOCKCHAIN_HOME: ${GREEN}$NOCKCHAIN_HOME${RESET}"
+      echo -e "  NOCKCHAIN_BIN:  ${GREEN}$NOCKCHAIN_BIN${RESET}"
+      echo ""
+      menu_entries=(
+        "↩️  Cancel and return to main menu"
+        "Edit NOCKCHAIN_BIN   [current: $NOCKCHAIN_BIN]"
+        "Edit NOCKCHAIN_HOME  [current: $NOCKCHAIN_HOME]"
+        "Edit NOCKCHAIN_USER  [current: $NOCKCHAIN_USER]"
+      )
+      selected=$(printf "%s\n" "${menu_entries[@]}" | fzf --prompt="Select parameter to edit: " \
+        --pointer="👉" --color=prompt:blue,fg+:cyan,bg+:238,pointer:green,marker:green \
+        --header=$'\nUse ↑ ↓ arrows to select. ENTER to confirm.\n')
+      [[ -z "$selected" || "$selected" == "↩️  Cancel and return to main menu" ]] && break
 
-    if [[ -z "$miner_dirs" ]]; then
-      echo -e "${RED}❌ No miner directories found.${RESET}"
-      read -n 1 -s -r -p $'\nPress any key to return to menu...'
-      continue
-    fi
-
-    if ! command -v fzf &>/dev/null; then
-      echo -e "${YELLOW}fzf not found. Installing fzf...${RESET}"
-      sudo apt-get update && sudo apt-get install -y fzf
-      echo -e "${GREEN}fzf installed successfully.${RESET}"
-    fi
-
-    # Improved fzf-based miner log menu with status indicators and formatting
-    declare -a menu_entries=()
-    declare -A miner_logs
-
-    # Collect miner info into array of lines: "miner_id|log_path|status"
-    miner_info_lines=()
-    for dir in $miner_dirs; do
-      miner_name=$(basename "$dir" | sed -nE 's/^(miner[0-9]+)$/\1/p')
-      [[ -z "$miner_name" ]] && continue
-      log_path="$dir/${miner_name}.log"
-      service_name="nockchain-$miner_name"
-      if systemctl is-active --quiet "$service_name"; then
-        status_icon="🟢"
-      else
-        status_icon="🔴"
+      if [[ "$selected" == *"NOCKCHAIN_USER"* ]]; then
+        read -rp "Enter new NOCKCHAIN_USER (current: $NOCKCHAIN_USER, press Enter to keep): " new_user
+        if [[ -n "$new_user" ]]; then
+          NOCKCHAIN_USER="$new_user"
+          echo -e "${GREEN}NOCKCHAIN_USER updated to '$NOCKCHAIN_USER'!${RESET}"
+        else
+          echo -e "${YELLOW}No change made.${RESET}"
+        fi
+      elif [[ "$selected" == *"NOCKCHAIN_HOME"* ]]; then
+        read -rp "Enter new NOCKCHAIN_HOME (current: $NOCKCHAIN_HOME, press Enter to keep): " new_home
+        if [[ -n "$new_home" ]]; then
+          NOCKCHAIN_HOME="$new_home"
+          echo -e "${GREEN}NOCKCHAIN_HOME updated to '$NOCKCHAIN_HOME'!${RESET}"
+        else
+          echo -e "${YELLOW}No change made.${RESET}"
+        fi
+      elif [[ "$selected" == *"NOCKCHAIN_BIN"* ]]; then
+        read -rp "Enter new NOCKCHAIN_BIN (current: $NOCKCHAIN_BIN, press Enter to keep): " new_bin
+        if [[ -n "$new_bin" ]]; then
+          NOCKCHAIN_BIN="$new_bin"
+          echo -e "${GREEN}NOCKCHAIN_BIN updated to '$NOCKCHAIN_BIN'!${RESET}"
+        else
+          echo -e "${YELLOW}No change made.${RESET}"
+        fi
       fi
-      miner_info_lines+=("$miner_name|$log_path|$status_icon")
-      miner_logs["$miner_name"]="$log_path"
+
+      # Always update settings file after any change
+      cat >"$SETTINGS_FILE" <<EOF
+NOCKCHAIN_USER="$NOCKCHAIN_USER"
+NOCKCHAIN_HOME="$NOCKCHAIN_HOME"
+NOCKCHAIN_BIN="$NOCKCHAIN_BIN"
+EOF
+      source "$SETTINGS_FILE"
+      sleep 1
+      clear
     done
-
-    # Sort by miner number
-    IFS=$'\n' sorted_info=($(printf "%s\n" "${miner_info_lines[@]}" | sort -t'|' -k1,1n))
-    unset IFS
-
-    # Build menu entries with formatting
-    for info in "${sorted_info[@]}"; do
-      miner_id=$(echo "$info" | cut -d'|' -f1)
-      log_path=$(echo "$info" | cut -d'|' -f2)
-      status_icon=$(echo "$info" | cut -d'|' -f3)
-      label="$(printf "%s %b%-8s%b %b[%s]%b" "$status_icon" "${BOLD_BLUE}" "$miner_id" "${RESET}" "${DIM}" "$log_path" "${RESET}")"
-      menu_entries+=("$label")
-    done
-
-    # Add Show all at the top and Cancel directly after, then the miners
-    menu_entries=("📡 Show all miner logs combined (live)" "↩️  Cancel and return to menu" "${menu_entries[@]}")
-
-    selected=$(printf "%s\n" "${menu_entries[@]}" | fzf --ansi --prompt="Select miner: " \
-      --pointer="👉" --marker="✓" \
-      --color=prompt:blue,fg+:cyan,bg+:238,pointer:green,marker:green \
-      --header=$'\nUse ↑ ↓ arrows or type to search. ENTER to confirm.\n')
-    plain_selected=$(echo -e "$selected" | sed 's/\x1b\[[0-9;]*m//g')
-
-    if [[ "$plain_selected" == *"Show all miner logs"* ]]; then
-      echo -e "${CYAN}Streaming combined logs from all miners...${RESET}"
-      echo -e "${DIM}Press Ctrl+C to return to menu.${RESET}"
-      temp_log_script=$(mktemp)
-      cat >"$temp_log_script" <<'EOL'
-#!/bin/bash
-source "$HOME/.nockchain_launcher.conf"
-trap "exit 0" INT
-tail -f $(find "$NOCKCHAIN_HOME" -maxdepth 1 -type d -name "miner*" -exec bash -c '
-  for d; do 
-    f="$d/$(basename "$d").log"
-    [[ -f "$f" ]] && echo "$f"
-  done
-' _ {} +)
-EOL
-      chmod +x "$temp_log_script"
-      bash "$temp_log_script"
-      echo -e "${YELLOW}Log stream ended. Press any key to return to the main menu...${RESET}"
-      read -n 1 -s
-      rm -f "$temp_log_script"
-      continue
-    fi
-
-    selected_miner=$(echo "$plain_selected" | sed -nE 's/.*(miner[0-9]+).*/\1/p')
-    [[ ! "$selected_miner" =~ ^miner[0-9]+$ ]] && {
-      echo -e "${RED}❌ Invalid selection. No miner selected.${RESET}"
-      read -n 1 -s
-      continue
-    }
-    selected_miner=$(echo "$selected_miner" | tr -d '\n\r')
-
-    if [[ -z "$selected" || "$selected" == *"Cancel and return to menu"* ]]; then
-      echo -e "${YELLOW}Returning to menu...${RESET}"
-      continue
-    fi
-
-    # Extract miner name from selection (match e.g. "minerX")
-    miner_log=""
-    [[ -z "$selected_miner" || -z "${miner_logs[$selected_miner]:-}" ]] && {
-      echo -e "${RED}❌ Invalid selection. No log file found for: $selected_miner${RESET}"
-      read -n 1 -s -r -p $'\nPress any key to return to menu...'
-      continue
-    }
-    miner_log="${miner_logs[$selected_miner]}"
-
-    if [[ ! -f "$miner_log" ]]; then
-      echo -e "${RED}❌ Log file not found: ${DIM}${miner_log}${RESET}"
-      read -n 1 -s -r -p $'\nPress any key to return to menu...'
-      continue
-    fi
-    echo -e "${CYAN}Streaming logs for $selected_miner...${RESET}"
-    echo -e "${DIM}Press Ctrl+C to return to menu.${RESET}"
-    temp_log_script=$(mktemp)
-    cat >"$temp_log_script" <<EOL
-#!/bin/bash
-source "$HOME/.nockchain_launcher.conf"
-trap "echo -e '\n${YELLOW}Log stream ended. Press any key to return to the main menu...${RESET}'; read -n 1 -s; exit 0" INT
-tail -f "$miner_log"
-EOL
-    chmod +x "$temp_log_script"
-    bash "$temp_log_script"
-    rm -f "$temp_log_script"
     continue
     ;;
+
+  # ===== Main Menu Option 24 =====
+  24)
+    clear
+    ensure_fzf_installed
+    echo -e "${CYAN}Clear Log Files${RESET}"
+    echo ""
+
+    # List of known log files
+    declare -A LOG_FILES
+    LOG_FILES["Build Log"]="$NOCKCHAIN_HOME/nockbuild.log"
+    LOG_FILES["Update Log"]="$NOCKCHAIN_HOME/nockupdate.log"
+    LOG_FILES["Wallet Update Log"]="$NOCKCHAIN_HOME/walletupdate.log"
+    LOG_FILES["Statejam Backup Log"]="$NOCKCHAIN_HOME/statejam_backup.log"
+    LOG_FILES["Export Log"]="$NOCKCHAIN_HOME/export.log"
+
+    # Miner logs (only main logs and CSVs, not rotated logs)
+    for miner_dir in "$NOCKCHAIN_HOME"/miner[0-9]*; do
+      [[ -d "$miner_dir" ]] || continue
+      miner_label=$(basename "$miner_dir")
+      miner_log="$miner_dir/${miner_label}.log"
+      if [[ -f "$miner_log" ]]; then
+        LOG_FILES["${miner_label}.log"]="$miner_log"
+      fi
+      # Add miner CSV logs (block/proof logs)
+      for csv in "$miner_dir"/*.csv; do
+        [[ -f "$csv" ]] && LOG_FILES["${miner_label}/$(basename "$csv")"]="$csv"
+      done
+    done
+
+    # Create the selection menu (fzf multi-select)
+    LOG_SELECT_LIST=()
+    for k in "${!LOG_FILES[@]}"; do
+      if [[ -f "${LOG_FILES[$k]}" ]]; then
+        LOG_SELECT_LIST+=("$k")
+      fi
+    done
+
+    # Sort the log list using version sort for natural ordering
+    IFS=$'\n' LOG_SELECT_LIST_SORTED=($(printf "%s\n" "${LOG_SELECT_LIST[@]}" | sort -V))
+    LOG_SELECT_LIST=("${LOG_SELECT_LIST_SORTED[@]}")
+    unset LOG_SELECT_LIST_SORTED
+
+    # Concise ALL/CVS delete options as the first entries after cancel
+    LOG_SELECT_LIST=(
+      "↩️  Cancel and return to main menu"
+      "🧹  Delete ALL logs (all logs + rotated logs + CSVs)"
+      "🧹  Delete ALL miner logs (all miner.log & rotated logs)"
+      "🧹  Delete ALL block CSV logs"
+      "🧹  Delete ALL proof CSV logs"
+      "🧹  Delete ALL CSV logs (block and proof)"
+      "${LOG_SELECT_LIST[@]}"
+    )
+
+    if [[ ${#LOG_SELECT_LIST[@]} -le 2 ]]; then
+      echo -e "${YELLOW}No log files found.${RESET}"
+      read -n 1 -s -r -p $'\nPress any key to return to the menu...'
+      continue
+    fi
+
+    # Use fzf for multi-select
+    selected=$(printf "%s\n" "${LOG_SELECT_LIST[@]}" | fzf --multi --prompt="Select logs to delete: " \
+      --pointer="👉" --color=prompt:blue,fg+:cyan,bg+:238,pointer:green,marker:green \
+      --header=$'\nTAB to select, ENTER to confirm. ESC to cancel.\n')
+
+    # If ESC pressed, or cancel option selected, return to menu
+    if [[ -z "$selected" ]] || grep -Fxq "↩️  Cancel and return to main menu" <<<"$selected"; then
+      echo -e "${YELLOW}No logs selected. Returning to menu.${RESET}"
+      echo -e "${YELLOW}Press any key to return to the main menu...${RESET}"
+      read -n 1 -s
+      continue
+    fi
+
+    # If "Delete ALL logs (all logs + rotated logs + CSVs)" is selected, confirmation and delete everything
+    if grep -Fxq "🧹  Delete ALL logs (all logs + rotated logs + CSVs)" <<<"$selected"; then
+      echo ""
+      echo -e "${RED}⚠️  WARNING: You have selected to delete ALL logs.${RESET}"
+      echo -e "${RED}This will permanently delete ALL log files and ALL rotated logs for ALL miners!${RESET}"
+      echo -e "${RED}This action CANNOT be undone.${RESET}"
+      echo -e ""
+      if ! confirm_yes_no "Are you ABSOLUTELY sure you want to delete ALL logs?"; then
+        echo -e "${YELLOW}Aborted.${RESET}"
+        echo -e "${YELLOW}Press any key to return to the main menu...${RESET}"
+        read -n 1 -s
+        continue
+      fi
+      # Delete all unique files in LOG_FILES
+      declare -A DELETED_PATHS
+      for path in "${LOG_FILES[@]}"; do
+        [[ -f "$path" ]] || continue
+        if [[ -z "${DELETED_PATHS[$path]:-}" ]]; then
+          rm -f "$path"
+          DELETED_PATHS["$path"]=1
+        fi
+      done
+      # Delete all rotated logs for ALL miners
+      for miner_dir in "$NOCKCHAIN_HOME"/miner[0-9]*; do
+        [[ -d "$miner_dir" ]] || continue
+        miner_label=$(basename "$miner_dir")
+        rm -f "$miner_dir/$miner_label.log" "$miner_dir/$miner_label"-*.log
+      done
+      echo ""
+      echo -e "${GREEN}✅ All logs and rotated logs have been deleted.${RESET}"
+      echo -e "${YELLOW}Press any key to return to the main menu...${RESET}"
+      read -n 1 -s
+      continue
+    fi
+
+    # If "Delete ALL miner logs (all miner.log & rotated logs)" is selected, confirmation and delete all miner logs only
+    if grep -Fxq "🧹  Delete ALL miner logs (all miner.log & rotated logs)" <<<"$selected"; then
+      echo ""
+      echo -e "${RED}⚠️  WARNING: You have selected to delete ALL miner log files (.log and rotated logs) for ALL miners.${RESET}"
+      echo -e "${RED}This will permanently delete all minerX.log and minerX-*.log files in ALL miner folders!${RESET}"
+      echo -e "${RED}This action CANNOT be undone.${RESET}"
+      echo -e ""
+      if ! confirm_yes_no "Are you ABSOLUTELY sure you want to delete ALL miner log files?"; then
+        echo -e "${YELLOW}Aborted.${RESET}"
+        echo -e "${YELLOW}Press any key to return to the main menu...${RESET}"
+        read -n 1 -s
+        continue
+      fi
+      deleted_count=0
+      for miner_dir in "$NOCKCHAIN_HOME"/miner[0-9]*; do
+        [[ -d "$miner_dir" ]] || continue
+        miner_label=$(basename "$miner_dir")
+        logs=("$miner_dir/$miner_label.log" "$miner_dir/$miner_label"-*.log)
+        for logf in "${logs[@]}"; do
+          [[ -f "$logf" ]] && rm -f "$logf" && ((deleted_count++))
+        done
+      done
+      echo ""
+      echo -e "${GREEN}✅ Deleted $deleted_count miner log files from all miner folders.${RESET}"
+      echo -e "${YELLOW}Press any key to return to the main menu...${RESET}"
+      read -n 1 -s
+      continue
+    fi
+
+    # If "Delete ALL CSV logs (block and proof)" is selected, confirmation and delete all CSVs
+    if grep -Fxq "🧹  Delete ALL CSV logs (block and proof)" <<<"$selected"; then
+      echo ""
+      echo -e "${RED}⚠️  WARNING: You have selected to delete ALL miner .csv files.${RESET}"
+      echo -e "${RED}This will permanently delete ALL CSV files in ALL miner folders!${RESET}"
+      echo -e "${RED}This action CANNOT be undone.${RESET}"
+      echo -e ""
+      if ! confirm_yes_no "Are you ABSOLUTELY sure you want to delete ALL miner .csv files?"; then
+        echo -e "${YELLOW}Aborted.${RESET}"
+        echo -e "${YELLOW}Press any key to return to the main menu...${RESET}"
+        read -n 1 -s
+        continue
+      fi
+      deleted_count=$(find "$NOCKCHAIN_HOME"/miner[0-9]* -type f -name "*.csv" -print -delete | wc -l)
+      echo ""
+      echo -e "${GREEN}✅ Deleted $deleted_count CSV files from all miner folders.${RESET}"
+      echo -e "${YELLOW}Press any key to return to the main menu...${RESET}"
+      read -n 1 -s
+      continue
+    fi
+
+    # If "Delete ALL block CSV logs" is selected
+    if grep -Fxq "🧹  Delete ALL block CSV logs" <<<"$selected"; then
+      echo ""
+      echo -e "${RED}⚠️  WARNING: You have selected to delete ALL block log CSV files (minerX_block_log.csv).${RESET}"
+      echo -e "${RED}This will permanently delete ALL block log CSV files in ALL miner folders!${RESET}"
+      echo -e "${RED}This action CANNOT be undone.${RESET}"
+      echo -e ""
+      if ! confirm_yes_no "Are you ABSOLUTELY sure you want to delete ALL miner block log CSV files?"; then
+        echo -e "${YELLOW}Aborted.${RESET}"
+        echo -e "${YELLOW}Press any key to return to the main menu...${RESET}"
+        read -n 1 -s
+        continue
+      fi
+      deleted_count=$(find "$NOCKCHAIN_HOME"/miner[0-9]* -type f -name "*_block_log.csv" -print -delete | wc -l)
+      echo ""
+      echo -e "${GREEN}✅ Deleted $deleted_count block log CSV files from all miner folders.${RESET}"
+      echo -e "${YELLOW}Press any key to return to the main menu...${RESET}"
+      read -n 1 -s
+      continue
+    fi
+
+    # If "Delete ALL proof CSV logs" is selected
+    if grep -Fxq "🧹  Delete ALL proof CSV logs" <<<"$selected"; then
+      echo ""
+      echo -e "${RED}⚠️  WARNING: You have selected to delete ALL proof log CSV files (minerX_proof_log.csv).${RESET}"
+      echo -e "${RED}This will permanently delete ALL proof log CSV files in ALL miner folders!${RESET}"
+      echo -e "${RED}This action CANNOT be undone.${RESET}"
+      echo -e ""
+      if ! confirm_yes_no "Are you ABSOLUTELY sure you want to delete ALL miner proof log CSV files?"; then
+        echo -e "${YELLOW}Aborted.${RESET}"
+        echo -e "${YELLOW}Press any key to return to the main menu...${RESET}"
+        read -n 1 -s
+        continue
+      fi
+      deleted_count=$(find "$NOCKCHAIN_HOME"/miner[0-9]* -type f -name "*_proof_log.csv" -print -delete | wc -l)
+      echo ""
+      echo -e "${GREEN}✅ Deleted $deleted_count proof log CSV files from all miner folders.${RESET}"
+      echo -e "${YELLOW}Press any key to return to the main menu...${RESET}"
+      read -n 1 -s
+      continue
+    fi
+
+    # Otherwise, normal behavior for selected logs
+    echo ""
+    echo -e "${RED}WARNING: You are about to delete the following log files:${RESET}"
+    echo -e "${DIM}$selected${RESET}"
+    if ! confirm_yes_no "Are you sure you want to delete the selected log files?"; then
+      echo -e "${YELLOW}Aborted.${RESET}"
+      echo -e "${YELLOW}Press any key to return to the main menu...${RESET}"
+      read -n 1 -s
+      continue
+    fi
+
+    # Delete selected logs (skip cancel and ALL logs options)
+    while IFS= read -r logname; do
+      [[ "$logname" == "↩️  Cancel and return to main menu" ]] && continue
+      [[ "$logname" == "🧹  Delete ALL logs (all logs + rotated logs + CSVs)" ]] && continue
+      [[ "$logname" == "🧹  Delete ALL miner logs (all miner.log & rotated logs)" ]] && continue
+      [[ "$logname" == "🧹  Delete ALL CSV logs (block and proof)" ]] && continue
+      [[ "$logname" == "🧹  Delete ALL block CSV logs" ]] && continue
+      [[ "$logname" == "🧹  Delete ALL proof CSV logs" ]] && continue
+      logpath="${LOG_FILES[$logname]}"
+      # If this is a minerX.log, delete all rotated logs as well
+      if [[ "$logname" =~ ^miner[0-9]+\.log$ ]]; then
+        miner_dir="$(dirname "$logpath")"
+        miner_label="$(basename "$logpath" .log)"
+        echo -e "${GREEN}Deleted:${RESET} $logname and all rotated logs"
+        rm -f "$miner_dir/$miner_label.log" "$miner_dir/$miner_label"-*.log
+      else
+        if [[ -f "$logpath" ]]; then
+          rm -f "$logpath"
+          echo -e "${GREEN}Deleted:${RESET} $logname"
+        fi
+      fi
+    done <<<"$selected"
+
+    echo ""
+    echo -e "${GREEN}✅ Selected logs cleared.${RESET}"
+    echo -e "${YELLOW}Press any key to return to the main menu...${RESET}"
+    read -n 1 -s
+    continue
+    ;;
+
+  # ===== Main Menu Invalid Option =====
   *)
     echo -e "${RED}Invalid option selected. Returning to menu...${RESET}"
     sleep 1
@@ -2839,30 +3163,3 @@ EOL
   esac
 
 done
-
-#
-# Function: export_latest_state_jam
-# (For use in backup service or manual invocation)
-export_latest_state_jam() {
-  latest_state_file=""
-  highest_block=-1
-  for dir in "$NOCKCHAIN_HOME"/miner[0-9]*; do
-    miner_name=$(basename "$dir" | sed -nE 's/^(miner[0-9]+)$/\1/p')
-    [[ -z "$miner_name" ]] && continue
-    [ -d "$dir" ] || continue
-    state_file="$dir/state.jam"
-    if [[ -f "$state_file" ]]; then
-      block=$(strings "$state_file" | grep -oE 'block [0-9]+' | grep -oE '[0-9]+' | head -n 1)
-      if [[ "$block" =~ ^[0-9]+$ ]] && ((block > highest_block)); then
-        highest_block=$block
-        latest_state_file="$state_file"
-      fi
-    fi
-  done
-  if [[ -n "$latest_state_file" && -f "$latest_state_file" ]]; then
-    cp "$latest_state_file" "$NOCKCHAIN_HOME/state_backup.jam"
-    echo "[$(date)] Copied state.jam (block $highest_block) to $NOCKCHAIN_HOME/state_backup.jam"
-  else
-    echo "[$(date)] No valid state.jam found for backup."
-  fi
-}
