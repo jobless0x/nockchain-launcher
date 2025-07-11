@@ -1925,7 +1925,7 @@ EOS
   # ===== Main Menu Option 12 =====
   12)
     clear
-    miner_dirs=$(find "$NOCKCHAIN_HOME" -maxdepth 1 -type d -name "miner*" | sort -V)
+    miner_dirs=$(find "$NOCKCHAIN_HOME" -maxdepth 1 -type d -name "miner[0-9]*" | sort -V)
 
     if [[ -z "$miner_dirs" ]]; then
       echo -e "${RED}❌ No miner directories found.${RESET}"
@@ -1959,8 +1959,8 @@ EOS
       miner_logs["$miner_name"]="$log_path"
     done
 
-    # Sort by miner number
-    IFS=$'\n' sorted_info=($(printf "%s\n" "${miner_info_lines[@]}" | sort -t'|' -k1,1n))
+    # Sort by miner index
+    IFS=$'\n' sorted_info=($(printf "%s\n" "${miner_info_lines[@]}" | sort -t'|' -k1.6n))
     unset IFS
 
     # Build menu entries with formatting
