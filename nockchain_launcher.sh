@@ -264,9 +264,7 @@ update_proof_durations() {
 
   # Bootstrap: scan all finished-proof lines, clean ANSI codes, and filter for lines with block/timestamp
   mapfile -t fp_lines < <(
-    LC_ALL=C tr -d '\000' <"$log_file" |
-      grep -a 'finished-proof' |
-      sed 's/\x1B\[[0-9;]*m//g'
+    sed 's/\x1B\[[0-9;]*m//g' "$log_file" | grep -a 'finished-proof'
   )
 
   # Determine if we should skip the bulk loop (if CSV exists and last entry is newer than 1 hour)
@@ -287,7 +285,7 @@ update_proof_durations() {
     total_checked=0
     for ((idx = ${#fp_lines[@]} - 1; idx >= 0 && valid_count < 50; idx--)); do
       fp_line="${fp_lines[idx]}"
-      block=$(echo "$fp_line" | tr -d '\000' | sed 's/\x1B\[[0-9;]*m//g' | grep -oP '\[.*\]' | grep -oP '([0-9]+\.){4,}[0-9]+' | tr -d '\000' | head -n 1)
+      block=$(echo "$fp_line" | tr -d '\000' | sed 's/\x1B\[[0-9;]*m//g' | grep -oP 'block\s+\K[0-9]+\.[0-9]+' | tr -d '\000' | head -n 1)
       finish_time=$(echo "$fp_line" | tr -d '\000' | grep -oP '\(\K[0-9]{2}:[0-9]{2}:[0-9]{2}')
       if [[ -z "$block" || -z "$finish_time" ]]; then
         ((total_checked++))
@@ -306,7 +304,7 @@ update_proof_durations() {
           mline=$(tr -d '\000' </tmp/${miner}_pre.log | grep -a 'mining-on' | tail -n 1)
         fi
       fi
-      start_time=$(echo "$mline" | tr -d '\000' | sed 's/\x1B\[[0-9;]*m//g' | awk '/mining-on/ { match($0, /\([0-9]{2}:[0-9]{2}:[0-9]{2}\)/); if (RSTART > 0) print substr($0, RSTART+1, RLENGTH-2); exit }')
+      start_time=$(echo "$mline" | sed 's/\x1B\[[0-9;]*m//g' | grep -a -oP '\(\K[0-9]{2}:[0-9]{2}:[0-9]{2}')
       if [[ -z "$start_time" ]]; then
         ((total_checked++))
         continue
@@ -328,7 +326,7 @@ update_proof_durations() {
 
   # Process latest finished-proof line (repeat logic for most recent entry)
   last_comp="--"
-  fp_line=$(LC_ALL=C tr -d '\000' <"$log_file" | grep -a 'finished-proof' | sed 's/\x1B\[[0-9;]*m//g' | tail -n 1)
+  fp_line=$(sed 's/\x1B\[[0-9;]*m//g' "$log_file" | grep -a 'finished-proof' | tail -n 1)
   block=$(echo "$fp_line" | tr -d '\000' | sed 's/\x1B\[[0-9;]*m//g' | grep -oE '[0-9]+(\.[0-9]+){4,}' | tr -d '\000' | head -n 1)
   finish_time=$(echo "$fp_line" | tr -d '\000' | grep -oP '\(\K[0-9]{2}:[0-9]{2}:[0-9]{2}')
   if [[ -n "$block" && -n "$finish_time" ]]; then
@@ -344,7 +342,7 @@ update_proof_durations() {
         mline=$(grep -a 'mining-on' /tmp/${miner}_pre.log | tail -n 1 | tr -d '\000')
       fi
     fi
-    start_time=$(echo "$mline" | tr -d '\000' | sed 's/\x1B\[[0-9;]*m//g' | awk '/mining-on/ { match($0, /\([0-9]{2}:[0-9]{2}:[0-9]{2}\)/); if (RSTART > 0) print substr($0, RSTART+1, RLENGTH-2); exit }')
+    start_time=$(echo "$mline" | sed 's/\x1B\[[0-9;]*m//g' | grep -a -oP '\(\K[0-9]{2}:[0-9]{2}:[0-9]{2}')
     if [[ -n "$start_time" ]]; then
       comp=$(($(date -d "$finish_time" +%s) - $(date -d "$start_time" +%s)))
       # Check for duplicate before appending
@@ -393,7 +391,7 @@ get_block_deltas() {
 
   # Parse log for lines containing only 'added to validated blocks at' with timestamp and block
   mapfile -t validated_block_lines < <(
-    grep -a 'added to validated blocks at' "$log_file" | tail -n 200
+    sed 's/\x1B\[[0-9;]*m//g' "$log_file" | grep -a 'added to validated blocks at' | tail -n 200
   )
 
   # Only run the bulk parsing loop if skip_bulk is not set
@@ -432,7 +430,7 @@ get_block_deltas() {
   fi
 
   # Always check the very latest 'added to validated blocks at' log line and add if new
-  latest_log_line=$(grep -a 'added to validated blocks at' "$log_file" | tail -n 1)
+  latest_log_line=$(sed 's/\x1B\[[0-9;]*m//g' "$log_file" | grep -a 'added to validated blocks at' | tail -n 1)
   if [[ -n "$latest_log_line" ]]; then
     latest_ts=$(echo "$latest_log_line" | grep -oP '\(\K[0-9]{2}:[0-9]{2}:[0-9]{2}')
     latest_blk=$(echo "$latest_log_line" | grep -oP 'at\s+\K([0-9]{1,3}(?:\.[0-9]{3})*)')
@@ -628,7 +626,7 @@ get_avg_proof_time_and_proofs_per_sec() {
 
 update_proof_attempts_log() {
   local miner="$1"
-  local log_file="$NOCKCHAIN_HOME/$miner/$miner.log"
+  local LOG_FILE="$NOCKCHAIN_HOME/$miner/$miner.log"
   local attempts_csv="$NOCKCHAIN_HOME/$miner/${miner}_attempt_log.csv"
 
   # Ensure CSV exists with header
@@ -643,13 +641,18 @@ update_proof_attempts_log() {
     last_csv_line=${last_csv_line:-0}
   fi
 
-  # Append only new entries (lines after last_csv_line) and filter sync/inactive
-  awk -v last_line="$last_csv_line" '
-    NR > last_line && /starting proving attempt/ && !/sync/i && !/inactive/i {
-      match($0, /\(([0-9]{2}:[0-9]{2}:[0-9]{2})\)/, arr);
-      if (length(arr[1])) print NR "," arr[1] "," $0
-    }
-  ' "$log_file" >>"$attempts_csv"
+  # Use sed to remove ANSI codes, then grep for "starting proving attempt", skipping sync/inactive, and append new entries
+  sed 's/\x1B\[[0-9;]*m//g' "$LOG_FILE" | \
+    awk -v last_line="$last_csv_line" '
+      /starting proving attempt/ && !/sync/i && !/inactive/i { line[++n] = $0 }
+      END {
+        for (i = 1; i <= n; i++) {
+          # Calculate actual line number as last_csv_line + i
+          match(line[i], /\(([0-9]{2}:[0-9]{2}:[0-9]{2})\)/, arr);
+          if (length(arr[1])) print (last_line + i) "," arr[1] "," line[i];
+        }
+      }
+    ' >>"$attempts_csv"
 
   # If CSV exceeds 51 lines (header + 50 data), trim to last 50
   local n_lines
