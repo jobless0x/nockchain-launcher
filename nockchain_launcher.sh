@@ -578,6 +578,89 @@ get_network_height() {
   echo "$NETWORK_HEIGHT"
 }
 
+get_avg_proof_time_and_proofs_per_sec() {
+  local miner="$1"
+  local attempts_csv="$NOCKCHAIN_HOME/$miner/${miner}_attempt_log.csv"
+  local total avg_proof_time proofs_per_sec
+
+  if [[ ! -f "$attempts_csv" ]]; then
+    echo "-- --"
+    return
+  fi
+
+  # Read last 50 timestamps (skip header, extract second field, skip empty)
+  mapfile -t attempts < <(awk -F, 'NR>1 && $2 ~ /^[0-9]{2}:[0-9]{2}:[0-9]{2}$/ {print $2}' "$attempts_csv" | tail -n 50)
+  total=${#attempts[@]}
+  if ((total < 2)); then
+    echo "-- --"
+    return
+  fi
+
+  local prev="" sum=0 count=0
+  for ts in "${attempts[@]}"; do
+    curr=$(date -d "$ts" +%s 2>/dev/null)
+    if [[ -n "$prev" && -n "$curr" ]]; then
+      diff=$((curr - prev))
+      if ((diff > 0)); then
+        sum=$((sum + diff))
+        count=$((count + 1))
+      fi
+    fi
+    prev="$curr"
+  done
+  if ((count > 0)); then
+    avg_proof_time=$(awk -v s="$sum" -v c="$count" 'BEGIN { printf "%.2f", s/c }')
+  else
+    avg_proof_time="--"
+  fi
+
+  # Proofs/sec: total span from first to last
+  first_sec=$(date -d "${attempts[0]}" +%s 2>/dev/null)
+  last_sec=$(date -d "${attempts[-1]}" +%s 2>/dev/null)
+  duration=$((last_sec - first_sec))
+  if ((duration > 0)); then
+    proofs_per_sec=$(awk -v t="$total" -v d="$duration" 'BEGIN { printf "%.4f", t/d }')
+  else
+    proofs_per_sec="--"
+  fi
+  echo "$avg_proof_time $proofs_per_sec"
+}
+
+update_proof_attempts_log() {
+  local miner="$1"
+  local log_file="$NOCKCHAIN_HOME/$miner/$miner.log"
+  local attempts_csv="$NOCKCHAIN_HOME/$miner/${miner}_attempt_log.csv"
+
+  # Ensure CSV exists with header
+  if [[ ! -f "$attempts_csv" ]]; then
+    echo "line_number,timestamp,log_line" >"$attempts_csv"
+  fi
+
+  # Get last recorded log line number
+  local last_csv_line=0
+  if [[ -s "$attempts_csv" ]]; then
+    last_csv_line=$(tail -n 1 "$attempts_csv" | cut -d',' -f1)
+    last_csv_line=${last_csv_line:-0}
+  fi
+
+  # Append only new entries (lines after last_csv_line) and filter sync/inactive
+  awk -v last_line="$last_csv_line" '
+    NR > last_line && /starting proving attempt/ && !/sync/i && !/inactive/i {
+      match($0, /\(([0-9]{2}:[0-9]{2}:[0-9]{2})\)/, arr);
+      if (length(arr[1])) print NR "," arr[1] "," $0
+    }
+  ' "$log_file" >>"$attempts_csv"
+
+  # If CSV exceeds 51 lines (header + 50 data), trim to last 50
+  local n_lines
+  n_lines=$(wc -l <"$attempts_csv")
+  if ((n_lines > 51)); then
+    head -n 1 "$attempts_csv" >"$attempts_csv.tmp"
+    tail -n 50 "$attempts_csv" >>"$attempts_csv.tmp"
+    mv "$attempts_csv.tmp" "$attempts_csv"
+  fi
+}
+
 #
 # Begin main launcher loop that displays the menu and handles user input
 # Check for interactive terminal (TTY) before entering the loop
@@ -1977,8 +2060,8 @@ EOS
       printf "${CYAN}🧮 Total CPU Usage:${RESET} ${YELLOW}%-6s%%${RESET} | ${CYAN}Total Mem:${RESET} ${YELLOW}%s%%${RESET} (${YELLOW}%s${RESET}/${YELLOW}%s${RESET} GB)\n" \
         "$TOTAL_CPU" "$TOTAL_MEM_PCT" "$TOTAL_MEM_USED" "$TOTAL_MEM_TOTAL"
       echo ""
-      printf "   | %-9s | %-9s | %-9s | %-9s | %-9s | %-9s | %-5s | %-9s | %-6s | %-9s | %-9s | %-9s | %-9s\n" \
-        "Miner" "Uptime" "CPU" "MEM" "RAM (GB)" "Block" "Lag" "Status" "Peers" "LastProof" "AvgProof" "BlkAge" "AvgBlk"
+      printf "   | %-9s | %-9s | %-9s | %-9s | %-9s | %-9s | %-5s | %-9s | %-6s | %-9s | %-9s | %-13s | %-13s | %-9s | %-9s\n" \
+        "Miner" "Uptime" "CPU" "MEM" "RAM (GB)" "Block" "Lag" "Status" "Peers" "LastProof" "AvgProof" "AvgAttempt" "Attempts/s" "BlkAge" "AvgBlk"
 
       all_miners=()
       for miner_dir in "$NOCKCHAIN_HOME"/miner[0-9]*; do
@@ -2033,17 +2116,6 @@ EOS
           /^\[.*\]/ {found=0}
           found && /^MINE_FLAG=/ {sub(/^MINE_FLAG=/, ""); print; exit}
         ' "$LAUNCH_CFG")
-
-        # --- Populate values ---
-        proof_metrics=$(update_proof_durations "$session")
-        IFS='|' read -r last_comp avg_comp <<<"$proof_metrics"
-        last_comp=${last_comp:-"--"}
-        avg_comp=${avg_comp:-"--"}
-
-        block_metrics=$(get_block_deltas "$session")
-        IFS='|' read -r last_blk avg_blk <<<"$block_metrics"
-        last_blk=${last_blk:-"--"}
-        avg_blk=${avg_blk:-"--"}
 
         avg_blk=$(echo "$avg_blk" | tr -d '\n\r')
         [[ -z "$avg_blk" ]] && avg_blk="--"
@@ -2147,6 +2219,43 @@ EOS
             status_raw="SYNCING"
           fi
         fi
+
+        # Only run LastProof | AvgProof if MINING; else, set to '--'
+        if [[ "${status_raw^^}" == "MINING" ]]; then
+          proof_metrics=$(update_proof_durations "$session")
+          IFS='|' read -r last_comp avg_comp <<<"$proof_metrics"
+          last_comp=${last_comp:-"--"}
+          avg_comp=${avg_comp:-"--"}
+        else
+          last_comp="--"
+          avg_comp="--"
+        fi
+
+        # Only skip get_block_deltas if miner is INACTIVE; run for MINING and SYNC ONLY
+        if [[ "${status_raw^^}" == "INACTIVE" ]]; then
+          last_blk="--"
+          avg_blk="--"
+        else
+          block_metrics=$(get_block_deltas "$session")
+          IFS='|' read -r last_blk avg_blk <<<"$block_metrics"
+        fi
+
+        # Only compute for real mining miners (after status_raw is set)
+        avg_proof_time="--"
+        proofs_per_sec="--"
+        if [[ "$status_raw" == "MINING" ]]; then
+          if type update_proof_attempts_log &>/dev/null; then
+            update_proof_attempts_log "$session" 2>/dev/null || true
+          fi
+          if type get_avg_proof_time_and_proofs_per_sec &>/dev/null; then
+            read avg_proof_time proofs_per_sec < <(get_avg_proof_time_and_proofs_per_sec "$session" 2>/dev/null) || true
+          fi
+          [[ -z "$avg_proof_time" ]] && avg_proof_time="--"
+          [[ -z "$proofs_per_sec" ]] && proofs_per_sec="--"
+        fi
+        avg_proof_time_s=$(add_s "$avg_proof_time")
+        avg_proof_time_display=$(pad_plain "${YELLOW}${avg_proof_time_s}${RESET}" 13)
+        proofs_per_sec_display=$(pad_plain "${CYAN}${proofs_per_sec}${RESET}" 13)
 
         # Miner name coloring
         session_padded=$(printf "%-9s" "$session")
@@ -2267,8 +2376,8 @@ EOS
         blk_age_display=$(pad_plain "$blk_age_colored" 9)
         avg_blk_display=$(pad_plain "$avg_blk_colored" 9)
 
-        printf "%b | %b | %b | %b | %b | %b | %b | %b | %b | %b | %b | %b | %b | %b\n" \
-          "$icon" "$session_display" "$uptime_display" "$cpu_display" "$mem_display" "$ram_display" "$block_display" "$lag_display" "$status_display" "$peer_display" "$last_comp_display" "$avg_comp_display" "$blk_age_display" "$avg_blk_display"
+        printf "%b | %b | %b | %b | %b | %b | %b | %b | %b | %b | %b | %b | %b | %b | %b | %b\n" \
+          "$icon" "$session_display" "$uptime_display" "$cpu_display" "$mem_display" "$ram_display" "$block_display" "$lag_display" "$status_display" "$peer_display" "$last_comp_display" "$avg_comp_display" "$avg_proof_time_display" "$proofs_per_sec_display" "$blk_age_display" "$avg_blk_display"
       done
 
       echo ""
