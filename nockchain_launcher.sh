@@ -1059,24 +1059,437 @@ except Exception as e:
       miner_dirs_map["$miner_name"]="$dir"
       miner_blocks_map["$miner_name"]="$latest_block"
     done
-    menu_entries=("↩️  Cancel and return to menu" "$GD_COMMIT_DISPLAY" "$GITHUB_COMMIT_DISPLAY" "${menu_entries[@]}")
+
+    # Get latest state.jam from Filebin
+    TMP_FILEBIN_META="/tmp/statebin-uploads.txt"
+    curl -fsSL "https://raw.githubusercontent.com/jobless0x/nockchain-launcher/main/statebin-uploads.txt" -o "$TMP_FILEBIN_META"
+    # Parse latest Filebin block
+    filebin_block_display=""
+    if [[ -s "$TMP_FILEBIN_META" ]]; then
+      # Get last .jam file
+      last_filebin_filename=$(tail -n 1 "$TMP_FILEBIN_META" | awk -F'|' '{print $2}' | xargs)
+      # Get block number
+      block_numeric=$(echo "$last_filebin_filename" | grep -oE '[0-9]+')
+      # Format as dotted block
+      if [[ "$block_numeric" =~ ^[0-9]+$ ]]; then
+        block_len=${#block_numeric}
+        if ((block_len > 3)); then
+          main_part=${block_numeric:0:block_len-3}
+          tail_part=${block_numeric:block_len-3:3}
+          block_dot="${main_part}.${tail_part}"
+        else
+          block_dot="${block_numeric}"
+        fi
+        filebin_block_display="(block $block_dot)"
+      else
+        filebin_block_display="(block ?)"
+      fi
+    else
+      filebin_block_display="(block ?)"
+    fi
+    FILEBIN_COMMIT_DISPLAY="⬇️  Download latest state.jam from Filebin $filebin_block_display"
+    menu_entries=("↩️  Cancel and return to menu" "🚀 AUTO detect the latest state.jam source" "$GD_COMMIT_DISPLAY" "$GITHUB_COMMIT_DISPLAY" "$FILEBIN_COMMIT_DISPLAY" "${menu_entries[@]}")
 
     selected=$(printf "%s\n" "${menu_entries[@]}" | fzf --ansi --prompt="Select miner to export from: " \
       --pointer="👉" --color=prompt:blue,fg+:cyan,bg+:238,pointer:green,marker:green \
       --header=$'\nUse ↑ ↓ arrows to navigate. ENTER to confirm.\n')
 
+    if [[ "$selected" == *"AUTO"* ]]; then
+      clear
+      echo -e "${CYAN}🔎 Auto-selecting best source for state.jam...${RESET}"
+
+      # Re-fetch all latest block numbers
+      # Google Drive
+      TMP_CLONE="$NOCKCHAIN_HOME/tmp_drive_download"
+      rm -rf "$TMP_CLONE"
+      mkdir -p "$TMP_CLONE"
+      GDRIVE_FOLDER_ID="1aEYZwmg4isTuYXWFn9gKPl92-pYndwUw"
+      echo -e "${DIM}Checking Google Drive source...${RESET}"
+      python3 - <<EOF >"$TMP_CLONE/jam_files.txt" 2>&1
+import subprocess
+import signal
+import time
+
+folder_id = "$GDRIVE_FOLDER_ID"
+cmd = ["gdown", "--folder", folder_id]
+
+process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+time.sleep(2)
+process.send_signal(signal.SIGINT)
+stdout, stderr = process.communicate(timeout=5)
+
+output = (stdout + "\n" + stderr).strip().splitlines()
+for line in output:
+    if line.startswith("Processing file") and ".jam" in line:
+        parts = line.split()
+        file_id, file_name = parts[2], parts[3]
+        print(f"{file_id}\t{file_name}")
+EOF
+
+      GD_BLOCK="--"
+      GD_LATEST_ID=""
+      GD_LATEST_BLOCK=""
+      if [[ -s "$TMP_CLONE/jam_files.txt" ]]; then
+        highest_gd_block=0
+        while IFS=$'\t' read -r id name; do
+          [[ -z "$id" || -z "$name" || "$name" != *.jam ]] && continue
+          block=$(echo "$name" | grep -oE '[0-9]+' || echo "0")
+          if [[ "$block" =~ ^[0-9]+$ ]] && ((block > highest_gd_block)); then
+            highest_gd_block=$block
+            GD_BLOCK="$block"
+            GD_LATEST_ID="$id"
+            GD_LATEST_BLOCK="$block"
+          fi
+        done <"$TMP_CLONE/jam_files.txt"
+      else
+        echo -e "${YELLOW}⚠ No .jam files found on Google Drive.${RESET}"
+      fi
+      rm -rf "$TMP_CLONE"
+
+      # GitHub
+      GITHUB_BLOCK="$BLOCK_COMMIT_VERSION"
+
+      # Filebin
+      TMP_FILEBIN_META="/tmp/statebin-Uploads.txt"
+      echo -e "${DIM}Checking Filebin source...${RESET}"
+      curl -fsSL "https://raw.githubusercontent.com/jobless0x/nockchain-launcher/main/statebin-uploads.txt" -o "$TMP_FILEBIN_META" || {
+        echo -e "${YELLOW}⚠ Failed to fetch Filebin metadata (URL not found). Skipping Filebin.${RESET}"
+        FILEBIN_BLOCK="--"
+      }
+      FILEBIN_BLOCK="--"
+      if [[ -s "$TMP_FILEBIN_META" ]]; then
+        last_filebin_filename=$(tail -n 1 "$TMP_FILEBIN_META" | awk -F'|' '{print $2}' | xargs)
+        FILEBIN_BLOCK=$(echo "$last_filebin_filename" | grep -oE '[0-9]+' || echo "0")
+      fi
+
+      # Miner (local)
+      MINER_BLOCK="--"
+      highest_miner_block=0
+      for d in "$NOCKCHAIN_HOME"/miner[0-9]*; do
+        [[ -d "$d" ]] || continue
+        miner_name=$(basename "$d" | sed -nE 's/^(miner[0-9]+)$/\1/p')
+        [[ -z "$miner_name" ]] && continue
+        log="$d/$miner_name.log"
+        if [[ -f "$log" ]]; then
+          raw_line=$(grep -a 'added to validated blocks at' "$log" 2>/dev/null | tail -n 1 || true)
+          blk=$(echo "$raw_line" | grep -oP 'at\s+\K([0-9]{1,3}(?:\.[0-9]{3})*)' || true)
+          num=$(echo "$blk" | tr -d '.')
+          if [[ "$num" =~ ^[0-9]+$ ]] && ((num > highest_miner_block)); then
+            highest_miner_block=$num
+            MINER_BLOCK="$blk"
+            MINER_LATEST_DIR="$d"
+          fi
+        fi
+      done
+
+      # Normalize all blocks for comparison
+      gd_num=$(echo "$GD_BLOCK" | tr -d '.')
+      github_num=$(echo "$GITHUB_BLOCK" | tr -d '.')
+      filebin_num=$(echo "$FILEBIN_BLOCK" | tr -d '.')
+      miner_num=$(echo "$MINER_BLOCK" | tr -d '.')
+
+      [[ ! "$gd_num" =~ ^[0-9]+$ ]] && gd_num=0
+      [[ ! "$github_num" =~ ^[0-9]+$ ]] && github_num=0
+      [[ ! "$filebin_num" =~ ^[0-9]+$ ]] && filebin_num=0
+      [[ ! "$miner_num" =~ ^[0-9]+$ ]] && miner_num=0
+
+      # Decide best source
+      max_num=$gd_num
+      max_src="Google Drive"
+      src_tag="gd"
+      if ((github_num > max_num)); then
+        max_num=$github_num
+        max_src="GitHub"
+        src_tag="gh"
+      fi
+      if ((filebin_num > max_num)); then
+        max_num=$filebin_num
+        max_src="Filebin"
+        src_tag="fb"
+      fi
+      if ((miner_num > max_num)); then
+        max_num=$miner_num
+        max_src="Local Miner"
+        src_tag="miner"
+      fi
+
+      echo -e ""
+      echo -e "${CYAN}Summary of latest blocks:${RESET}"
+      echo -e "  Google Drive:  ${YELLOW}$GD_BLOCK${RESET}"
+      echo -e "  GitHub:        ${YELLOW}$GITHUB_BLOCK${RESET}"
+      echo -e "  Filebin:       ${YELLOW}$FILEBIN_BLOCK${RESET}"
+      echo -e "  Local Miner:   ${YELLOW}$MINER_BLOCK${RESET}"
+      echo -e ""
+      echo -e "${BOLD_BLUE}Most recent block is ${YELLOW}$max_num${BOLD_BLUE} from ${GREEN}$max_src${RESET}."
+      echo -e ""
+
+      # Ask for confirmation
+      confirm_yes_no "Proceed to fetch state.jam from $max_src (block $max_num)?" || {
+        echo -e "${CYAN}Returning to menu...${RESET}"
+        continue
+      }
+
+      # Set selected for all sources
+      if [[ "$src_tag" == "gd" ]]; then
+        selected="$GD_COMMIT_DISPLAY"
+      elif [[ "$src_tag" == "gh" ]]; then
+        selected="$GITHUB_COMMIT_DISPLAY"
+      elif [[ "$src_tag" == "fb" ]]; then
+        selected="$FILEBIN_COMMIT_DISPLAY"
+      elif [[ "$src_tag" == "miner" ]]; then
+        selected="Local Miner block $MINER_BLOCK"
+      else
+        echo -e "${RED}Unknown source, aborting.${RESET}"
+        read -n 1 -s
+        continue
+      fi
+    fi
+
+    if [[ "$selected" == "Local Miner block"* ]]; then
+      clear
+      export_dir="$NOCKCHAIN_HOME/miner-export"
+      state_output="$NOCKCHAIN_HOME/state.jam"
+      best_dir="$MINER_LATEST_DIR"
+      if [[ -z "$best_dir" ]]; then
+        echo -e "${RED}❌ Could not find local miner folder with block $MINER_BLOCK. Aborting.${RESET}"
+        read -n 1 -s
+        continue
+      fi
+      echo -e "${CYAN}Creating temporary copy of miner with latest block...${RESET}"
+      rm -rf "$export_dir"
+      cp -a "$best_dir" "$export_dir"
+      echo -e "${CYAN}Exporting state.jam to $state_output...${RESET}"
+      cd "$export_dir"
+      "$NOCKCHAIN_BIN" --export-state-jam "$state_output" 2>&1 | tee "$NOCKCHAIN_HOME/export.log"
+      cd "$NOCKCHAIN_HOME"
+      rm -rf "$export_dir"
+      echo ""
+      echo -e "${GREEN}✅ Exported state.jam from duplicate of ${CYAN}$(basename "$best_dir")${GREEN} (block ${BOLD_BLUE}$MINER_BLOCK${GREEN}) to ${CYAN}$state_output${GREEN}.${RESET}"
+      echo -e "${DIM}To view detailed export logs: tail -n 20 $NOCKCHAIN_HOME/export.log${RESET}"
+      echo ""
+      echo -e "${YELLOW}Press any key to return to the main menu...${RESET}"
+      read -n 1 -s
+      continue
+    fi
+
+    if [[ "$selected" == *"Filebin"* ]]; then
+      clear
+      # Fetch Filebin metadata
+      TMP_FILEBIN_META="/tmp/statebin-uploads.txt"
+      curl -fsSL "https://raw.githubusercontent.com/jobless0x/nockchain-launcher/main/statebin-uploads.txt" -o "$TMP_FILEBIN_META"
+      if [[ ! -s "$TMP_FILEBIN_META" ]]; then
+        echo -e "${RED}Error: Failed to download statebin-uploads.txt or file is empty${RESET}"
+        read -n 1 -s -r -p $'\nPress any key to return to the main menu...'
+        continue
+      fi
+
+      # Parse Filebin meta
+      RAW_LINE=$(tail -n 1 "$TMP_FILEBIN_META")
+      PARSED_LINE=$(echo "$RAW_LINE" | tr -d '\000' | tr -cd '\11\12\15\40-\176' | sed 's/^[ \t]*//;s/[ \t]*$//')
+      CLEANED_LINE=$(echo "$PARSED_LINE" | tr -d '\000')
+      IFS='|' read filebin_dt filebin_filename filebin_url <<<"$CLEANED_LINE"
+      filebin_dt=$(echo "$filebin_dt" | xargs)
+      filebin_filename=$(echo "$filebin_filename" | xargs)
+      filebin_url=$(echo "$filebin_url" | xargs)
+
+      # Check Filebin URL
+      filebin_url=$(echo "$filebin_url" | tr -d '\r\n' | sed 's/[[:space:]]*$//')
+      if [[ -z "$filebin_url" ]]; then
+        echo -e "${RED}Error: Missing URL in statebin-uploads.txt${RESET}"
+        tail -n 1 "$TMP_FILEBIN_META"
+        read -n 1 -s -r -p $'\nPress any key to return to the main menu...'
+        continue
+      fi
+      if ! echo "$filebin_url" | grep -qE '^https?://'; then
+        echo -e "${RED}Error: URL ($filebin_url) does not match expected pattern${RESET}"
+        read -n 1 -s -r -p $'\nPress any key to return to the main menu...'
+        continue
+      fi
+      filebin_date=$(echo "$filebin_dt" | cut -d' ' -f1)
+      filebin_time=$(echo "$filebin_dt" | cut -d' ' -f2)
+      # Get numeric and dotted block
+      filebin_block_numeric=$(echo "$filebin_filename" | grep -oE '[0-9]+' | head -n 1)
+      filebin_block_dot=""
+      if [[ "$filebin_block_numeric" =~ ^[0-9]+$ ]]; then
+        block_len=${#filebin_block_numeric}
+        if ((block_len > 3)); then
+          main_part=${filebin_block_numeric:0:block_len-3}
+          tail_part=${filebin_block_numeric:block_len-3:3}
+          filebin_block_dot="${main_part}.${tail_part}"
+        else
+          filebin_block_dot="${filebin_block_numeric}"
+        fi
+      else
+        filebin_block_dot="?"
+      fi
+
+      echo -e "${CYAN}Latest Filebin snapshot:${RESET}"
+      echo -e "  Block:   ${YELLOW}$filebin_block_dot${RESET}"
+      echo -e "  File:    ${YELLOW}$filebin_filename${RESET}"
+      echo -e "  Uploaded:${YELLOW}$filebin_dt${RESET}"
+      echo -e "  URL:     ${CYAN}$filebin_url${RESET}"
+
+      # Parse upload time
+      filebin_epoch=$(date -d "$filebin_dt" +%s 2>/dev/null || echo 0)
+
+      # Fetch Filebin HTML
+      TMP_FILEBIN_HTML="/tmp/filebin.html"
+      curl -sL 'https://filebin.net/joblessnock/?show=true' >"$TMP_FILEBIN_HTML"
+
+      # Parse .jam names/times
+      declare -A jam_file_time
+      while read -r fname ftime; do
+        jam_file_time["$fname"]="$ftime"
+      done < <(
+        awk '
+          /<tr>/ {row="";inrow=1}
+          /<\/tr>/ {inrow=0; row=row $0 "\n";
+            if (row ~ /\.jam/ && row ~ /[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}/) {
+              match(row, /([0-9]+\.jam)/, fname)
+              match(row, /([0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2})/, ftime)
+              print fname[1], ftime[1]
+            }
+          }
+          /<tr>/,/<\/tr>/ {row=row $0 "\n"}
+        ' "$TMP_FILEBIN_HTML"
+      )
+
+      # Get latest .jam file
+      if ((${#jam_file_time[@]} > 0)); then
+        filebin_filename=$(printf '%s\n' "${!jam_file_time[@]}" | sort -n | tail -n1)
+        filebin_upload_time="${jam_file_time[$filebin_filename]}"
+      else
+        filebin_filename=""
+        filebin_upload_time=""
+      fi
+
+      # Abort if parse fails
+      if [[ -z "$filebin_filename" || -z "$filebin_upload_time" ]]; then
+        echo -e "${RED}❌ Could not parse Filebin HTML for .jam files. Aborting.${RESET}"
+        read -n 1 -s -r -p $'\nPress any key to return to the main menu...'
+        continue
+      fi
+
+      # Check upload time
+      filebin_epoch=$(date -d "$filebin_dt" +%s 2>/dev/null || echo 0)
+      if [[ -n "$filebin_upload_time" ]]; then
+        filebin_uploaded_epoch=$(date -d "$filebin_upload_time" +%s 2>/dev/null || echo 0)
+      else
+        filebin_uploaded_epoch=0
+      fi
+      if [[ "$filebin_uploaded_epoch" -gt 0 && "$filebin_epoch" -gt 0 ]]; then
+        time_diff_min=$(((filebin_epoch - filebin_uploaded_epoch) / 60))
+        abs_time_diff_min=${time_diff_min#-}
+        if ((abs_time_diff_min > 10)); then
+          echo -e ""
+          echo -e "${RED}❌ Filebin file upload time and GitHub .txt record differ by >10 minutes!${RESET}"
+          read -n 1 -s -r -p $'\nPress any key to return to the main menu...'
+          continue
+        fi
+        echo -e "${GREEN}Filebin upload time matches GitHub record (diff: ${abs_time_diff_min} min).${RESET}"
+      else
+        echo -e "${YELLOW}⚠️  Could not validate Filebin upload time. Proceed with caution.${RESET}"
+      fi
+
+      # Block version sanity check
+      latest_ref_block="$filebin_block_numeric"
+      if [[ -s "$TMP_FILEBIN_META" ]]; then
+        latest_ref_block=$(tr -d '\000' <"$TMP_FILEBIN_META" | awk -F'|' '
+          {
+            fn = $2
+            gsub(/^[ \t]+|[ \t]+$/, "", fn)
+            blk = fn
+            if (match(fn, /[0-9]+/)) {
+              blk = substr(fn, RSTART, RLENGTH)
+              blk += 0
+              if (blk > max) max = blk
+            }
+          }
+          END { print max }
+        ')
+      fi
+      if [[ -z "$latest_ref_block" ]]; then
+        latest_ref_block="$filebin_block_numeric"
+      fi
+      latest_ref_block_int=$(echo "$latest_ref_block" | grep -oE '[0-9]+' | head -n 1)
+      # Numeric compare blocks
+      if [[ -n "$filebin_block_numeric" && -n "$latest_ref_block_int" && "$filebin_block_numeric" =~ ^[0-9]+$ && "$latest_ref_block_int" =~ ^[0-9]+$ ]]; then
+        if ((filebin_block_numeric < latest_ref_block_int)); then
+          echo -e ""
+          echo -e "${RED}❌ Filebin snapshot is older than latest block recorded in statebin-uploads.txt ($latest_ref_block). Aborting for safety.${RESET}"
+          read -n 1 -s -r -p $'\nPress any key to return to the main menu...'
+          continue
+        fi
+      fi
+
+      echo -e ""
+      # Confirm & download
+      confirm_yes_no "Download and overwrite state.jam with this Filebin snapshot?" || {
+        echo -e "${CYAN}Returning to menu...${RESET}"
+        continue
+      }
+
+      echo -e ""
+      echo -e "${CYAN}Downloading state.jam from Filebin...${RESET}"
+      # Try wget for download
+      if command -v wget &>/dev/null; then
+        wget --no-check-certificate --content-disposition -O "$NOCKCHAIN_HOME/state.jam" "$filebin_url"
+        download_success=$?
+      else
+        download_success=1
+      fi
+
+      # Fallback to curl
+      if [[ $download_success -ne 0 || ! -s "$NOCKCHAIN_HOME/state.jam" ]]; then
+        curl -L --compressed -A "Mozilla/5.0" -o "$NOCKCHAIN_HOME/state.jam" "$filebin_url"
+      fi
+
+      # Sanity check: valid file
+      min_size_kb=5000
+      actual_size_kb=$(du -k "$NOCKCHAIN_HOME/state.jam" | awk '{print $1}')
+      file_head=$(head -c 32 "$NOCKCHAIN_HOME/state.jam")
+      if [[ ! -s "$NOCKCHAIN_HOME/state.jam" || "$file_head" =~ "<!doctype html>" || "$actual_size_kb" -lt "$min_size_kb" ]]; then
+        echo -e "${RED}❌ Download failed or invalid file${RESET}"
+        rm -f "$NOCKCHAIN_HOME/state.jam"
+        read -n 1 -s -r -p $'\nPress any key to return to the main menu...'
+        continue
+      fi
+
+      echo -e "${GREEN}✅ state.jam downloaded and saved as ${CYAN}$NOCKCHAIN_HOME/state.jam${RESET}"
+      read -n 1 -s -r -p $'\nPress any key to return to the main menu...'
+      continue
+    fi
+
     if [[ "$selected" == *"Google Drive"* ]]; then
       clear
       echo -e "${CYAN}📦 Step 1/4: Verifying required tools...${RESET}"
-      echo -e "${DIM}Checking for: wget, gdown, pip3...${RESET}"
-      for tool in wget gdown pip3; do
+      echo -e "${DIM}Checking for: wget, gdown, pip3, python3...${RESET}"
+      for tool in wget gdown pip3 python3; do
         if command -v "$tool" &>/dev/null; then
           echo -e "${GREEN}✔ $tool found${RESET}"
         else
           echo -e "${YELLOW}⚠ $tool not found. Installing...${RESET}"
+          if [[ "$tool" == "gdown" ]]; then
+            sudo apt-get update && sudo apt-get install -y python3-pip
+            pip3 install --user --force-reinstall gdown
+          elif [[ "$tool" == "wget" ]]; then
+            sudo apt-get update && sudo apt-get install -y wget
+          elif [[ "$tool" == "pip3" ]]; then
+            sudo apt-get update && sudo apt-get install -y python3-pip
+          elif [[ "$tool" == "python3" ]]; then
+            sudo apt-get update && sudo apt-get install -y python3
+          fi
         fi
       done
-      # Step 1: Try gdrive CLI, else fallback to scraping Google Drive folder page and use gdown
+
+      # Ensure PATH includes user-installed binaries
+      export PATH="$HOME/.local/bin:$PATH"
+
+      # Debug gdown version and path
+      gdown_version=$(gdown --version 2>&1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' || echo "unknown")
+      echo -e "${DIM}gdown version: $gdown_version at $(which gdown)${RESET}"
+
+      # Step 2: List files using Python and gdown
       TMP_CLONE="$NOCKCHAIN_HOME/tmp_drive_download"
       rm -rf "$TMP_CLONE"
       mkdir -p "$TMP_CLONE"
@@ -1084,128 +1497,54 @@ except Exception as e:
       GDRIVE_FOLDER_ID="1aEYZwmg4isTuYXWFn9gKPl92-pYndwUw"
       GDRIVE_FOLDER_URL="https://drive.google.com/drive/folders/$GDRIVE_FOLDER_ID"
 
-      use_gdrive_cli=0
-      if command -v gdrive &>/dev/null; then
-        GDRIVE_BIN="$(command -v gdrive)"
-        if [[ -x "$GDRIVE_BIN" ]] && "$GDRIVE_BIN" version &>/dev/null; then
-          use_gdrive_cli=1
-        fi
-      fi
-
-      if [[ "$use_gdrive_cli" == "1" ]]; then
-        echo ""
-        echo -e "${CYAN}📥 Step 1/4: Listing files from Google Drive with gdrive CLI...${RESET}"
-        GDRIVE_LIST_OUTPUT=$("$GDRIVE_BIN" list --no-header --query "'$GDRIVE_FOLDER_ID' in parents" --name-width 0 | grep '.jam' | awk '{print $1, $NF}')
-        if [[ -z "$GDRIVE_LIST_OUTPUT" ]]; then
-          echo -e "${RED}❌ Could not list files from Google Drive using gdrive CLI. Falling back to scraping method.${RESET}"
-          use_gdrive_cli=0
-        fi
-      fi
-
-      if [[ "$use_gdrive_cli" == "1" ]]; then
-        LATEST_FILE_ID=$(echo "$GDRIVE_LIST_OUTPUT" | awk '{gsub(".jam","",$2); print $1, $2}' | sort -k2 -n | tail -n 1 | awk '{print $1}')
-        LATEST_FILE_NAME=$(echo "$GDRIVE_LIST_OUTPUT" | awk '{gsub(".jam","",$2); print $1, $2}' | sort -k2 -n | tail -n 1 | awk '{print $2 ".jam"}')
-        LATEST_BLOCK=$(echo "$LATEST_FILE_NAME" | grep -oE '[0-9]+')
-
-        echo ""
-        echo -e "${CYAN}📥 Step 2/4: Downloading $LATEST_FILE_NAME (block $LATEST_BLOCK) using gdrive...${RESET}"
-        "$GDRIVE_BIN" download "$LATEST_FILE_ID" --path "$TMP_CLONE" --force
-        if [[ ! -f "$TMP_CLONE/$LATEST_FILE_NAME" ]]; then
-          echo -e "${RED}❌ Download failed via gdrive. Exiting.${RESET}"
-          rm -rf "$TMP_CLONE"
-          read -n 1 -s
-          continue
-        fi
-        mv "$TMP_CLONE/$LATEST_FILE_NAME" "$TMP_CLONE/state.jam"
-        echo ""
-        echo -e "${CYAN}📦 Step 3/4: Moving state.jam to $NOCKCHAIN_HOME and cleaning up...${RESET}"
-        mv "$TMP_CLONE/state.jam" "$NOCKCHAIN_HOME/state.jam"
-        rm -rf "$TMP_CLONE"
-        echo -e "${GREEN}✅ state.jam downloaded and saved to ${CYAN}$NOCKCHAIN_HOME/state.jam${GREEN}.${RESET}"
-        read -n 1 -s -r -p $'\nPress any key to return to the main menu...'
-        continue
-      fi
-
-      # Fallback: Scrape Google Drive folder page and use gdown
       echo ""
-      echo -e "${CYAN}📥 Step 2/4: Creating temp folder and scraping Google Drive folder page...${RESET}"
-      # Install wget and gdown if needed
-      if ! command -v wget &>/dev/null; then
-        echo -e "${YELLOW}wget not found. Installing...${RESET}"
-        sudo apt-get update && sudo apt-get install -y wget
-      fi
-      if ! command -v gdown &>/dev/null; then
-        echo -e "${YELLOW}gdown not found. Installing via pip...${RESET}"
-        if ! command -v pip3 &>/dev/null; then
-          sudo apt-get update && sudo apt-get install -y python3-pip
-        fi
-        pip3 install --user gdown
-        export PATH="$HOME/.local/bin:$PATH"
-      fi
+      echo -e "${CYAN}📥 Step 2/4: Listing files from Google Drive folder using gdown...${RESET}"
+      echo -e "${DIM}Fetching file list from Google Drive folder...${RESET}"
+      rm -rf /root/State\ Jams/* # Clean up partial downloads
+      python3 - <<EOF >"$TMP_CLONE/jam_files.txt" 2>&1
+import subprocess
+import signal
+import time
 
-      # --- BEGIN PATCH: Improved fallback Google Drive scraping logic ---
-      # 📥 Step 1/4: Download the folder page with a proper User-Agent
-      FOLDER_URL="https://drive.google.com/drive/folders/1aEYZwmg4isTuYXWFn9gKPl92-pYndwUw"
-      mkdir -p "$TMP_CLONE"
-      wget -qO "$TMP_CLONE/folder.html" --header="User-Agent: Mozilla/5.0" "$FOLDER_URL"
-      # Wait for folder.html to exist and be non-empty, up to 2.5 seconds
-      for i in {1..5}; do
-        [[ -s "$TMP_CLONE/folder.html" ]] && break
-        sleep 0.5
-      done
-      if [[ ! -s "$TMP_CLONE/folder.html" ]]; then
-        echo -e "${RED}❌ Failed to download or save folder.html properly.${RESET}"
+folder_id = "$GDRIVE_FOLDER_ID"
+cmd = ["gdown", "--folder", folder_id]
+
+process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+time.sleep(1.5)
+process.send_signal(signal.SIGINT)
+stdout, stderr = process.communicate(timeout=5)
+
+output = (stdout + "\n" + stderr).strip().splitlines()
+for line in output:
+    if line.startswith("Processing file") and ".jam" in line:
+        parts = line.split()
+        file_id, file_name = parts[2], parts[3]
+        print(f"{file_id}\t{file_name}")
+EOF
+
+      if [[ ! -s "$TMP_CLONE/jam_files.txt" ]]; then
+        echo -e "${RED}❌ Could not extract any .jam files from Google Drive folder.${RESET}"
+        echo "DEBUG: Content of jam_files.txt:"
+        cat "$TMP_CLONE/jam_files.txt"
         rm -rf "$TMP_CLONE"
         read -n 1 -s
         continue
       fi
 
-      # 📥 Step 2/4: Diagnostic extraction of .jam files and their IDs using Python+BeautifulSoup for robust parsing
-      echo -e "${DIM}Parsing folder.html for .jam entries (Python+BeautifulSoup)...${RESET}"
-      pip3 install -q beautifulsoup4
-      python3 - <<EOF
-import os
-from bs4 import BeautifulSoup
-
-tmp_clone = os.environ.get("TMP_CLONE", os.path.expanduser("$NOCKCHAIN_HOME/tmp_drive_download"))
-with open(f"{tmp_clone}/folder.html") as f:
-    soup = BeautifulSoup(f, "html.parser")
-
-ids = []
-jams = []
-for div in soup.find_all("div"):
-    if div.has_attr("data-id") and div["data-id"] != "_gd":
-        ids.append(div["data-id"])
-    if div.has_attr("data-tooltip") and "Binary:" in div["data-tooltip"] and ".jam" in div["data-tooltip"]:
-        name = div["data-tooltip"].split("Binary:")[-1].strip()
-        if name.endswith(".jam"):
-            jams.append(name)
-
-pairs = list(zip(ids, jams))
-
-with open(f"{tmp_clone}/jam_files.txt", "w") as out:
-    for id_, name in pairs:
-        out.write(f"{id_}\t{name}\n")
-EOF
-      if [[ ! -s "$TMP_CLONE/jam_files.txt" ]]; then
-        echo -e "${RED}❌ Could not extract any .jam files from folder.html.${RESET}"
-        read -n 1 -s
-        continue
-      fi
       echo -e "${DIM}Found $(wc -l <"$TMP_CLONE/jam_files.txt") .jam file(s).${RESET}"
       echo -e "${DIM}Discovered .jam files with IDs:${RESET}"
       while IFS=$'\t' read -r id name; do
-        # echo "[DEBUG] raw line: $id $name"
         [[ -z "$id" || -z "$name" || "$name" != *.jam ]] && continue
-        block=$(echo "$name" | grep -oE '[0-9]+')
+        block=$(echo "$name" | grep -oE '[0-9]+' || echo "0")
         echo -e "${CYAN}- $name${RESET} ${DIM}(block $block, id=$id)${RESET}"
       done <"$TMP_CLONE/jam_files.txt"
-      # Extract full metadata list and pick true latest based on numeric block
+
+      # Extract latest .jam file
       latest_block=-1
       latest_id=""
       latest_name=""
       while IFS=$'\t' read -r id name; do
-        block=$(echo "$name" | grep -oE '[0-9]+')
+        block=$(echo "$name" | grep -oE '[0-9]+' || echo "0")
         [[ -z "$id" || -z "$name" || -z "$block" ]] && continue
         if ((block > latest_block)); then
           latest_block=$block
@@ -1213,13 +1552,16 @@ EOF
           latest_name=$name
         fi
       done <"$TMP_CLONE/jam_files.txt"
-      # echo "[DEBUG] selected latest_name='$latest_name', latest_block='$latest_block', latest_id='$latest_id'"
+
       if [[ -z "$latest_id" || -z "$latest_name" || "$latest_block" -lt 0 ]]; then
         echo -e "${RED}❌ Could not extract latest .jam file correctly. Aborting.${RESET}"
+        echo "DEBUG: Content of jam_files.txt:"
+        cat "$TMP_CLONE/jam_files.txt"
         rm -rf "$TMP_CLONE"
         read -n 1 -s
         continue
       fi
+
       echo -e "${DIM}Selected latest .jam file: ${CYAN}$latest_name${DIM} (ID: $latest_id, Block: $latest_block)${RESET}"
       echo ""
       echo -e "${CYAN}📥 Step 3/4: Downloading state.jam (block $latest_block) using gdown...${RESET}"
