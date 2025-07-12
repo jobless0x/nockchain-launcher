@@ -14,13 +14,18 @@ fi
 REMOTE_VERSION=$(curl -fsSL https://raw.githubusercontent.com/jobless0x/nockchain-launcher/main/NOCKCHAIN_LAUNCHER_VERSION 2>/dev/null | tr -d '[:space:]')
 REMOTE_VERSION=${REMOTE_VERSION:-"(offline)"}
 
+# Color variable definitions
+WHITE="\033[97m"
 GREEN="\e[32m"
 RED="\e[31m"
 YELLOW="\e[33m"
+BOLD_YELLOW="\033[1;33m"
 CYAN="\e[36m"
 BOLD_BLUE="\e[1;34m"
+MAGENTA="\e[35m"
 DIM="\e[2m"
 RESET="\e[0m"
+BOLD="\033[1m"
 
 # Settings file
 SETTINGS_FILE="$HOME/.nockchain_launcher.conf"
@@ -77,10 +82,20 @@ ensure_fzf_installed() {
 
 # Helper: Ensure the nockchain binary exists before proceeding
 require_nockchain() {
+  local custom_message="${1:-}"
   if [[ ! -f "$NOCKCHAIN_BIN" ]]; then
-    echo -e "${RED}❌ Nockchain binary not found.${RESET}"
-    echo -e "${YELLOW}Please install it first using Option 1.${RESET}"
-    read -n 1 -s -r -p $'\nPress any key to return to the menu...'
+    clear
+    echo -e "${RED}❌ Nockchain binary not found!${RESET}"
+    echo ""
+    [[ -n "$custom_message" ]] && echo -e "${YELLOW}$custom_message${RESET}\n"
+    echo -e "${CYAN}You must install or update the binary before continuing.${RESET}"
+    echo ""
+    echo -e "${YELLOW}- Use option ${BOLD}1${RESET}${YELLOW} in the main menu to perform a full install."
+    echo -e "- Or option ${BOLD}2${RESET}${YELLOW} to update Nockchain if already installed.${RESET}"
+    echo ""
+    echo -e "${DIM}Tip: This check ensures your node is ready for all miner and state operations.${RESET}"
+    echo ""
+    read -r -p $'Press Enter to return to the main menu...'
     return 1
   fi
   return 0
@@ -716,7 +731,7 @@ EOF
   printf "${BOLD_BLUE}%-40s%-40s${RESET}\n" \
     "1) Install Nockchain from scratch" "21) Run system diagnostics" \
     "2) Update nockchain to latest version" "22) Monitor resource usage (htop)" \
-    "3) Update nockchain-wallet only" "23) Edit launcher settings" \
+    "3) Update nockchain-wallet only" "23) Change user, home directory, or install path" \
     "4) Update launcher script" "24) Clear logs (select which logs to delete)" \
     "5) Export or download state.jam file" "" \
     "6) Manage periodic state.jam backup" ""
@@ -969,7 +984,8 @@ EOF
   # ===== Main Menu Option 5 =====
   5)
     clear
-    require_nockchain || continue
+    require_nockchain "You need a working nockchain build to export state.jam." || continue
+    ensure_nockchain_executable
     miner_dirs=$(find "$NOCKCHAIN_HOME" -maxdepth 1 -type d -name "miner[0-9]*" | sort -V)
     ensure_fzf_installed
 
@@ -1335,6 +1351,7 @@ EOF
   6)
     clear
     require_nockchain || continue
+    ensure_nockchain_executable
     # Toggle systemd timer for periodic state.jam backup
     BACKUP_SERVICE_FILE="/etc/systemd/system/nockchain-statejam-backup.service"
     BACKUP_TIMER_FILE="/etc/systemd/system/nockchain-statejam-backup.timer"
@@ -2049,21 +2066,18 @@ EOL
   # ===== Main Menu Option 13 =====
   13)
     clear
-    require_nockchain || continue
+    echo -e ""
     echo -e "${YELLOW}You are about to configure and launch one or more miners.${RESET}"
+    echo -e ""
     confirm_yes_no "Do you want to continue with miner setup?" || {
+      echo -e ""
       echo -e "${CYAN}Returning to menu...${RESET}"
+      echo -e ""
       continue
     }
-    # Phase 2: Ensure Nockchain build exists before miner setup
-    if [ -f "$BINARY_PATH" ]; then
-      echo -e "${GREEN}✅ Build detected. Continuing to miner setup...${RESET}"
-    else
-      echo -e "${RED}!! ERROR: Build not completed or failed.${RESET}"
-      echo -e "${YELLOW}>> Check build log: $LOG_PATH${RESET}"
-      echo -e "${YELLOW}>> Resume screen: ${DIM}screen -r nockbuild${RESET}"
-      continue
-    fi
+
+    clear
+
     # Write run_miner.sh for systemd
     RUN_MINER_SCRIPT="$SCRIPT_DIR/run_miner.sh"
     cat >"$RUN_MINER_SCRIPT" <<'EOS'
@@ -2114,6 +2128,20 @@ MAX_ESTABLISHED=$(awk -v section="[miner$id]" '
 ' "$SCRIPT_DIR/launch.cfg")
 # --- END PATCHED BLOCK ---
 
+# --- BEGIN PATCH: Extract NUM_THREADS_FLAG and STACK_SIZE_FLAG ---
+NUM_THREADS_FLAG=$(awk -v section="[miner$id]" '
+  $0 == section {found=1; next}
+  /^\[.*\]/ {found=0}
+  found && /^NUM_THREADS_FLAG=/ {sub(/^NUM_THREADS_FLAG=/, ""); print; exit}
+' "$SCRIPT_DIR/launch.cfg")
+
+STACK_SIZE_FLAG=$(awk -v section="[miner$id]" '
+  $0 == section {found=1; next}
+  /^\[.*\]/ {found=0}
+  found && /^STACK_SIZE_FLAG=/ {sub(/^STACK_SIZE_FLAG=/, ""); print; exit}
+' "$SCRIPT_DIR/launch.cfg")
+# --- END PATCH: Extract NUM_THREADS_FLAG and STACK_SIZE_FLAG ---
+
 # --- BEGIN PATCH: Extract MINE_FLAG ---
 MINE_FLAG=$(awk -v section="[miner$id]" '
   $0 == section {found=1; next}
@@ -2155,15 +2183,20 @@ if [[ -n "$BIND_FLAG" && "$BIND_FLAG" != "--bind" ]]; then
   CMD+=($BIND_FLAG)
 fi
 [[ -n "$MAX_ESTABLISHED" ]] && CMD+=($MAX_ESTABLISHED)
+[[ -n "$NUM_THREADS_FLAG" ]] && CMD+=($NUM_THREADS_FLAG)
+[[ -n "$STACK_SIZE_FLAG" ]] && CMD+=($STACK_SIZE_FLAG)
 [[ -n "$EXTRA_FLAGS" ]] && CMD+=($EXTRA_FLAGS)
 [[ -n "$STATE_FLAG" ]] && CMD+=($STATE_FLAG)
 "${CMD[@]}" 2>&1 | tee "$LOGFILE"
 ## --- END PATCHED BLOCK ---
 EOS
     chmod +x "$RUN_MINER_SCRIPT"
-    echo -e "${GREEN}✅ run_miner.sh is ready.${RESET}"
+    echo -e "${GREEN}✅ The run_miner.sh script has been generated and is ready to use!${RESET}"
+    echo -e "${CYAN}  • This script will be called automatically when launching miners via the launcher.${RESET}"
+    echo -e "${CYAN}  • You can also run it manually for advanced debugging: ${DIM}./run_miner.sh <miner_number>${RESET}"
+    echo -e ""
 
-    # --- CLI Hook: Allow external --restart-miner <path> <key> ---
+    # External command entrypoints (for system automation/scripts)
     if [[ "${1:-}" == "--restart-miner" && -n "${2:-}" && -n "${3:-}" ]]; then
       MINING_KEY_DISPLAY="$3"
       restart_miner_session "$2"
@@ -2175,7 +2208,9 @@ EOS
       echo ""
       echo -e "${BOLD_BLUE}${CYAN}⚙️  Miner Configuration${RESET}"
       echo -e "${DIM}──────────────────────────────────────────────${RESET}"
+      echo ""
       cat "$LAUNCH_CFG"
+      echo -e ""
       echo -e "${DIM}──────────────────────────────────────────────${RESET}"
       echo ""
       echo -e "${YELLOW}Do you want to keep this existing configuration?${RESET}"
@@ -2188,367 +2223,847 @@ EOS
         [[ "$USE_EXISTING_CFG" == "1" || "$USE_EXISTING_CFG" == "2" ]] && break
         echo -e "${RED}❌ Invalid input. Please enter 1 or 2.${RESET}"
       done
-      if [[ "$USE_EXISTING_CFG" == "1" ]]; then
-        # Automatically count number of miners in existing config
-        NUM_MINERS=$(grep -c '^\[miner[0-9]\+\]' "$LAUNCH_CFG")
-        echo ""
-        echo -e "${GREEN}✅ Using existing configuration.${RESET}"
-        echo ""
-        echo -e "${BOLD_BLUE}${CYAN}🔧 Launch Preview${RESET}"
-        printf "  ${CYAN}%-10s %-22s %-22s${RESET}\n" "Miner" "Systemd Service" "Run Command"
-        for i in $(seq 1 "$NUM_MINERS"); do
-          MINER_DIR="$NOCKCHAIN_HOME/miner$i"
-          SERVICE="nockchain-miner$i.service"
-          RUN_CMD="cd $MINER_DIR && exec run_miner.sh $i"
-          printf "  ${BOLD_BLUE}%-10s${RESET} %-22s %-22s\n" "miner$i" "$SERVICE" "$RUN_CMD"
-        done
-        echo ""
-        echo -e "${YELLOW}Proceed? (y/n)${RESET}"
-        echo ""
-        while true; do
-          read -rp "$(echo -e "${BOLD_BLUE}> ${RESET}")" CONFIRM_EXISTING_LAUNCH
-          [[ "$CONFIRM_EXISTING_LAUNCH" =~ ^[YyNn]$ ]] && break
-          echo -e "${RED}❌ Please enter y or n.${RESET}"
-        done
-        if [[ "$CONFIRM_EXISTING_LAUNCH" =~ ^[Yy]$ ]]; then
-          echo ""
-          echo -e "${GREEN}Proceeding with miner launch...${RESET}"
-          for i in $(seq 1 "$NUM_MINERS"); do
-            MINER_DIR="$NOCKCHAIN_HOME/miner$i"
-            mkdir -p "$MINER_DIR"
-            generate_systemd_service $i
-            start_miner_service $i
-          done
-          echo ""
-          echo -e "${GREEN}\e[1m🎉 Success:${RESET}${GREEN} Nockchain miners launched via systemd!${RESET}"
-          echo ""
-          echo -e "${CYAN}  Manage your miners with the following commands:${RESET}"
-          echo -e "${CYAN}    - Status:   ${DIM}systemctl status nockchain-minerX${RESET}"
-          echo -e "${CYAN}    - Logs:     ${DIM}tail -f $NOCKCHAIN_HOME/minerX/minerX.log${RESET}"
-          echo -e "${CYAN}    - Stop:     ${DIM}sudo systemctl stop nockchain-minerX${RESET}"
-          echo -e "${CYAN}    - Start:    ${DIM}sudo systemctl start nockchain-minerX${RESET}"
-          echo ""
-          echo -e "${YELLOW}Press any key to return to the main menu...${RESET}"
-          read -n 1 -s
-          continue
-        else
-          echo ""
+    else
+      USE_EXISTING_CFG=2
+    fi
+
+    clear
+
+    # Custom setup sequence
+    if [[ "$USE_EXISTING_CFG" == "2" ]]; then
+      # Banner Step 1/4: Public Key
+      strip_ansi() {
+        echo -e "$1" | sed 's/\x1b\[[0-9;]*m//g'
+      }
+      BANNER_TITLE="Step 1/4: Public Key"
+      BANNER_PADDING=4
+      banner_title_len=${#BANNER_TITLE}
+      banner_inner_width=$((banner_title_len + BANNER_PADDING * 2))
+      [[ $banner_inner_width -lt 80 ]] && banner_inner_width=80
+      # Top border
+      echo -e "${BOLD_BLUE}╔$(printf '═%.0s' $(seq 1 $banner_inner_width))╗${RESET}"
+      # Centered title
+      pad_total=$((banner_inner_width - banner_title_len))
+      pad_left=$((pad_total / 2))
+      pad_right=$((pad_total - pad_left))
+      printf "${BOLD_BLUE}║%*s%s%*s║${RESET}\n" $pad_left "" "$BANNER_TITLE" $pad_right ""
+      # Bottom border
+      echo -e "${BOLD_BLUE}╚$(printf '═%.0s' $(seq 1 $banner_inner_width))╝${RESET}"
+      echo -e ""
+
+      # Check requiered
+      cd "$NOCKCHAIN_HOME"
+      export PATH="$PATH:$(pwd)/target/release"
+      export PATH="$HOME/.cargo/bin:$PATH"
+      echo "export PATH=\"\$PATH:$(pwd)/target/release\"" >>~/.bashrc
+
+      # Handle wallet import or generation if keys.export is not found
+      if [[ -f "keys.export" ]]; then
+        echo -e "${CYAN}>> Importing wallet from keys.export...${RESET}"
+        nockchain-wallet import-keys --input keys.export
+      else
+        echo -e "${YELLOW}No wallet (keys.export) found.${RESET}"
+        if ! confirm_yes_no "Do you want to generate a new wallet now?"; then
           echo -e "${CYAN}Returning to menu...${RESET}"
           continue
         fi
+        echo -e ""
+        echo -e "${CYAN}>> Generating new wallet...${RESET}"
+        nockchain-wallet keygen
+        echo -e ""
+        echo -e "${CYAN}>> Backing up keys to 'keys.export'...${RESET}"
+        echo ""
+        nockchain-wallet export-keys
+      fi
+
+      # Validate or request the user's mining public key
+      if grep -q "^MINING_PUBKEY=" .env; then
+        MINING_KEY=$(grep "^MINING_PUBKEY=" .env | cut -d= -f2)
       else
-        echo ""
-        echo -e "${YELLOW}⚠️ Discarding existing configuration...${RESET}"
-        rm -f "$LAUNCH_CFG"
-        echo ""
+        echo -e "${YELLOW}Enter your PUBLIC KEY to use for mining:${RESET}"
+        read -rp "$(echo -e "${BOLD_BLUE}> ${RESET}")" MINING_KEY
+        if [[ -z "$MINING_KEY" ]]; then
+          echo -e "${RED}!! ERROR: Public key cannot be empty.${RESET}"
+          continue
+        fi
+        sed -i "s/^MINING_PUBKEY=.*/MINING_PUBKEY=$MINING_KEY/" .env
       fi
-    fi
-    cd "$NOCKCHAIN_HOME"
-    export PATH="$PATH:$(pwd)/target/release"
-    export PATH="$HOME/.cargo/bin:$PATH"
-    echo "export PATH=\"\$PATH:$(pwd)/target/release\"" >>~/.bashrc
-    # Handle wallet import or generation if keys.export is not found
-    if [[ -f "keys.export" ]]; then
-      echo -e "${CYAN}>> Importing wallet from keys.export...${RESET}"
-      nockchain-wallet import-keys --input keys.export
-    else
-      echo -e "${YELLOW}No wallet (keys.export) found.${RESET}"
-      echo -e "${YELLOW}Do you want to generate a new wallet now? (y/n)${RESET}"
+
+      # Ask user to confirm or correct the public key before launch
       while true; do
-        read -rp "$(echo -e "${BOLD_BLUE}> ${RESET}")" CREATE_WALLET
-        [[ "$CREATE_WALLET" =~ ^[YyNn]$ ]] && break
-        echo -e "${RED}❌ Please enter y or n.${RESET}"
+        echo -e ""
+        echo -e "${YELLOW}The following mining public key will be used:${RESET}"
+        echo -e "${CYAN}$MINING_KEY${RESET}"
+        echo -e ""
+        if confirm_yes_no "Is this correct?"; then
+          break
+        fi
+        echo -e ""
+        echo -e "${YELLOW}Please enter the correct mining public key:${RESET}"
+        read -rp "$(echo -e "${BOLD_BLUE}> ${RESET}")" MINING_KEY
+        sed -i "s/^MINING_PUBKEY=.*/MINING_PUBKEY=$MINING_KEY/" .env
       done
-      if [[ ! "$CREATE_WALLET" =~ ^[Yy]$ ]]; then
-        echo -e "${CYAN}Returning to menu...${RESET}"
-        continue
-      fi
-      echo -e "${CYAN}>> Generating new wallet...${RESET}"
-      nockchain-wallet keygen
-      echo -e "${CYAN}>> Backing up keys to 'keys.export'...${RESET}"
+
+      clear
+
+      # Banner Step 2/4: Miner Config
+      strip_ansi() {
+        echo -e "$1" | sed 's/\x1b\[[0-9;]*m//g'
+      }
+      BANNER_TITLE="Step 2/4: Miner Config"
+      BANNER_PADDING=4
+      banner_title_len=${#BANNER_TITLE}
+      banner_inner_width=$((banner_title_len + BANNER_PADDING * 2))
+      [[ $banner_inner_width -lt 80 ]] && banner_inner_width=80
+      # Top border
+      echo -e "${BOLD_BLUE}╔$(printf '═%.0s' $(seq 1 $banner_inner_width))╗${RESET}"
+      # Centered title
+      pad_total=$((banner_inner_width - banner_title_len))
+      pad_left=$((pad_total / 2))
+      pad_right=$((pad_total - pad_left))
+      printf "${BOLD_BLUE}║%*s%s%*s║${RESET}\n" $pad_left "" "$BANNER_TITLE" $pad_right ""
+      # Bottom border
+      echo -e "${BOLD_BLUE}╚$(printf '═%.0s' $(seq 1 $banner_inner_width))╝${RESET}"
+
+      # System spec detection
+      CPU_PHYSICAL=$(lscpu | awk '/^Core\(s\) per socket:/ {cores=$4} /^Socket\(s\):/ {sockets=$2} END {print cores*sockets}')
+      CPU_THREADS=$(nproc)
+      RAM_TOTAL=$(free -g | awk '/^Mem:/ {print $2}')
+      RAM_TOTAL_MB=$(free -m | awk '/^Mem:/ {print $2}')
+      echo -e "${RESET}"
+      echo -e "${GREEN}Detected system:${RESET} 🖥️  ${BOLD_BLUE}${CPU_PHYSICAL}${RESET} physical cores, ${BOLD_BLUE}${CPU_THREADS}${RESET} threads   |   🧠  ${BOLD_BLUE}${RAM_TOTAL}${RESET} GB RAM (${RAM_TOTAL_MB} MB)"
+      echo -e ""
+      echo -e ""
+      echo -e "${CYAN}────────────────────────────────────────────────────────────────────────────────────────${RESET}"
+      echo -e "${BOLD_BLUE}How resources work in Nockchain mining:${RESET}"
+      echo -e "  • Each miner process runs independently and uses 1 or more CPU threads."
+      echo -e "  • ${YELLOW}--num-threads${RESET} controls CPU threads.  ${YELLOW}--stack-size${RESET} is the *total* RAM (not per-thread)."
+      echo -e "  • Example: ${CYAN}--stack-size medium${RESET} = reserves 16 GB RAM for that process, even if it uses 1 or 10 threads."
+      echo -e ""
+      echo -e "${CYAN}Available stack sizes:${RESET}  ${DIM}tiny${RESET}: 2 GB   | ${DIM}small${RESET}: 4 GB   | ${DIM}normal${RESET}: 8 GB   | ${DIM}medium${RESET}: 16 GB   | ${DIM}large${RESET}: 32 GB   | ${DIM}huge${RESET}: 64 GB"
+      echo -e "${CYAN}────────────────────────────────────────────────────────────────────────────────────────${RESET}"
+      echo -e ""
+
+      # Stack-size RAMs
+      declare -A STACK_RAM=([huge]=64 [big]=32 [large]=32 [medium]=16 [normal]=8 [small]=4 [tiny]=2)
+      STACKS=(huge big large medium normal small tiny)
+
+      RESERVE_RAM=4 # Always leave 4GB for OS
+      SYNC_MINER_THREADS=1
+      SYNC_MINER_STACK=""
+      SYNC_MINER_RAM=2 # Reserve 2GB for sync-only miner
+
+      CPU_THREADS_INT=${CPU_THREADS:-$(nproc)}
+      RAM_TOTAL_INT=${RAM_TOTAL:-$(free -g | awk '/^Mem:/ {print $2}')}
+      RAM_USABLE=$((RAM_TOTAL_INT - RESERVE_RAM - SYNC_MINER_RAM))
+      THREADS_USABLE=$((CPU_THREADS_INT - SYNC_MINER_THREADS))
+
+      declare -A miners_config
+      miners_config[1, "mode"]="sync-only"
+      miners_config[1, "threads"]=$SYNC_MINER_THREADS
+      miners_config[1, "stack"]="$SYNC_MINER_STACK"
+      miners_config[1, "ram"]=$SYNC_MINER_RAM
+
+      miner_id=2
+      threads_left=$THREADS_USABLE
+      ram_left=$RAM_USABLE
+
+      # Fill threads FIRST, using largest stack-size possible per miner for remaining RAM
+      while ((threads_left > 0 && ram_left >= 2)); do
+        for stack in "${STACKS[@]}"; do
+          stack_ram=${STACK_RAM[$stack]}
+          # Only use a miner if it fits in RAM left
+          if ((ram_left < stack_ram)); then
+            continue
+          fi
+          # Find max threads we can give this miner, given the remaining threads (but at least 1)
+          max_threads_this_miner=$threads_left
+          ((max_threads_this_miner < 1)) && continue
+          # Assign as many threads as possible to the biggest stack-size that fits, then continue
+          miners_config[$miner_id, "mode"]="mining"
+          miners_config[$miner_id, "threads"]=$max_threads_this_miner
+          miners_config[$miner_id, "stack"]=$stack
+          miners_config[$miner_id, "ram"]=$stack_ram
+          threads_left=$((threads_left - max_threads_this_miner))
+          ram_left=$((ram_left - stack_ram))
+          miner_id=$((miner_id + 1))
+          break # Always use the biggest available stack for each miner, then re-loop
+        done
+      done
+
+      # Helper: Remove ANSI escape sequences for accurate width calculation
+      strip_ansi() {
+        echo -e "$1" | sed 's/\x1b\[[0-9;]*m//g'
+      }
+      # Prepare all miner lines (strip color for width calculation)
+      BOX_TITLE=" Recommended Mining Layout "
+      BOX_PADDING=2 # spaces on each side
+      miner_lines_nocolor=()
+      miner_lines_colored=()
+      max_line_len=80
+      for ((i = 1; i < miner_id; i++)); do
+        mode=${miners_config[$i, "mode"]}
+        threads=${miners_config[$i, "threads"]}
+        stack=${miners_config[$i, "stack"]}
+        ram=${miners_config[$i, "ram"]}
+        miner_label="miner$i"
+        if [[ "$mode" == "sync-only" ]]; then
+          # No color, for length (do not display thread count for sync-only)
+          line_nocolor=$(printf "%-8s: %-9s   (no stack-size, ~2GB RAM reserved)" \
+            "$miner_label" "sync-only")
+          # Color version
+          line_colored="${BOLD_BLUE}${miner_label}${RESET}: ${CYAN}sync-only${RESET}   ${DIM}(no stack-size, ~2GB RAM reserved)${RESET}"
+        else
+          line_nocolor=$(printf "%-8s: %-9s, %2s thread(s), --stack-size %s ( %2s GB )" \
+            "$miner_label" "mining" "$threads" "$stack" "$ram")
+          line_colored="${miner_label}: ${GREEN}mining${RESET}, ${YELLOW}$threads${RESET} thread(s), --stack-size ${CYAN}$stack${RESET} ( ${YELLOW}$ram${RESET} GB )"
+        fi
+        miner_lines_nocolor+=("$line_nocolor")
+        miner_lines_colored+=("$line_colored")
+        # Update max width
+        ((${#line_nocolor} > max_line_len)) && max_line_len=${#line_nocolor}
+      done
+      # Compare with title length (strip color)
+      box_title_len=${#BOX_TITLE}
+      content_width=$box_title_len
+      ((max_line_len > content_width)) && content_width=$max_line_len
+      # Add padding (left+right)
+      box_inner_width=$((content_width + BOX_PADDING * 2))
+      # Borders: "╭" + "─" * box_inner_width + "╮"
+      echo -e "${BOLD_BLUE}╭$(printf '─%.0s' $(seq 1 $box_inner_width))╮${RESET}"
+      # Print centered title with padding
+      pad_total=$((box_inner_width - box_title_len))
+      pad_left=$((pad_total / 2))
+      pad_right=$((pad_total - pad_left))
+      printf "${BOLD_BLUE}│%*s%s%*s│${RESET}\n" $pad_left "" "$BOX_TITLE" $pad_right ""
+      # Print each miner line, with left/right padding, right border always aligned
+      for idx in "${!miner_lines_colored[@]}"; do
+        colored="${miner_lines_colored[$idx]}"
+        nocolor="$(strip_ansi "$colored")"
+        pad_right=$((content_width - ${#nocolor}))
+        printf "${BOLD_BLUE}│${RESET}%*s%b%*s${BOLD_BLUE}│${RESET}\n" $BOX_PADDING "" "$colored" $((BOX_PADDING + pad_right)) ""
+      done
+      # Bottom border
+      echo -e "${BOLD_BLUE}╰$(printf '─%.0s' $(seq 1 $box_inner_width))╯${RESET}"
+
+      total_mining_threads=0
+      total_mining_ram=0
+      for ((i = 2; i < miner_id; i++)); do
+        ((total_mining_threads += miners_config[$i, "threads"]))
+        ((total_mining_ram += miners_config[$i, "ram"]))
+      done
+
+      RAM_LEFT_FOR_OS=$((RAM_TOTAL_INT - total_mining_ram - SYNC_MINER_RAM))
+      [[ $RAM_LEFT_FOR_OS -lt $RESERVE_RAM ]] && RAM_LEFT_FOR_OS=$RESERVE_RAM
       echo ""
-      nockchain-wallet export-keys
-    fi
-    # Validate or request the user's mining public key
-    if grep -q "^MINING_PUBKEY=" .env; then
-      MINING_KEY=$(grep "^MINING_PUBKEY=" .env | cut -d= -f2)
-    else
-      echo -e "${YELLOW}Enter your PUBLIC KEY to use for mining:${RESET}"
-      read -rp "$(echo -e "${BOLD_BLUE}> ${RESET}")" MINING_KEY
-      if [[ -z "$MINING_KEY" ]]; then
-        echo -e "${RED}!! ERROR: Public key cannot be empty.${RESET}"
-        continue
-      fi
-      sed -i "s/^MINING_PUBKEY=.*/MINING_PUBKEY=$MINING_KEY/" .env
-    fi
-    # Ask user to confirm or correct the public key before launch
-    while true; do
-      echo -e "${YELLOW}The following mining public key will be used:${RESET}"
-      echo -e "${CYAN}$MINING_KEY${RESET}"
-      echo -e "${YELLOW}Is this correct? (y/n)${RESET}"
+      echo -e "${DIM}Total mining: ${RESET}${YELLOW}$total_mining_threads${RESET} threads, ${YELLOW}$total_mining_ram${RESET} GB RAM  (plus ~2 GB for sync miner, plus OS headroom)"
+      echo -e "${MAGENTA}System headroom left:${RESET} ${CYAN}$RAM_TOTAL_INT${RESET} GB - ${YELLOW}$total_mining_ram${RESET} GB - 2 GB ≈ ${YELLOW}$RAM_LEFT_FOR_OS${RESET} GB"
+      echo ""
+      echo ""
+      echo -e "${RED}⚠️  Warning:${RESET} Maxing RAM and threads in a single miner can increase risk of a process crash = downtime."
+      echo ""
+      echo -e "${YELLOW}Pro tip:${RESET} To reduce risk, split miners (ex: 2×16 threads, 2×32 GB RAM) if you want more redundancy."
+      echo ""
+      echo -e "${DIM}This setup fills RAM and threads for max mining, always leaves a sync-only node, and auto-recalculates for any server.${RESET}"
+      echo ""
+      echo ""
+      echo -e "${YELLOW}Choose launch mode:${RESET}"
+      echo -e "  1) ${BOLD_BLUE}Use recommended config${RESET}  ${DIM}(auto-optimize)${RESET}"
+      echo -e "  2) ${BOLD_BLUE}Custom (advanced setup)${RESET}"
+
       while true; do
-        read -rp "$(echo -e "${BOLD_BLUE}> ${RESET}")" CONFIRM_KEY
-        [[ "$CONFIRM_KEY" =~ ^[YyNn]$ ]] && break
-        echo -e "${RED}❌ Please enter y or n.${RESET}"
+        read -rp "$(echo -e \"${BOLD_BLUE} choice [1/2]: ${RESET}\")" LAUNCH_MODE
+        [[ \"$LAUNCH_MODE\" == \"1\" || \"$LAUNCH_MODE\" == \"2\" ]] && break
+        echo -e \"${RED}❌ Invalid input. Please enter 1 or 2.${RESET}\"
       done
-      if [[ "$CONFIRM_KEY" =~ ^[Yy]$ ]]; then
-        break
-      fi
-      echo -e "${YELLOW}Please enter the correct mining public key:${RESET}"
-      read -rp "$(echo -e "${BOLD_BLUE}> ${RESET}")" MINING_KEY
-      sed -i "s/^MINING_PUBKEY=.*/MINING_PUBKEY=$MINING_KEY/" .env
-    done
-    # Configure and enable required UFW firewall rules for Nockchain
-    echo ""
-    echo -e "${CYAN}\e[1m▶ Configuring firewall...${RESET}"
-    sudo ufw allow ssh >/dev/null 2>&1 || true
-    sudo ufw allow 22 >/dev/null 2>&1 || true
-    sudo ufw allow 3005/tcp >/dev/null 2>&1 || true
-    sudo ufw allow 3006/tcp >/dev/null 2>&1 || true
-    sudo ufw allow 3005/udp >/dev/null 2>&1 || true
-    sudo ufw allow 3006/udp >/dev/null 2>&1 || true
-    sudo ufw --force enable >/dev/null 2>&1 || echo -e "${YELLOW}Warning: Failed to enable UFW. Continuing script execution.${RESET}"
-    echo -e "${GREEN}✅ Firewall configured.${RESET}"
-    echo ""
-    # Collect system specs and calculate optimal number of miners
-    CPU_CORES=$(nproc)
-    TOTAL_MEM=$(free -g | awk '/^Mem:/ {print $2}')
-    echo ""
-    while true; do
-      echo -e "${YELLOW}How many miners do you want to run?${RESET}"
-      echo -e "${DIM}Enter a number like 1, 3, 10... or type 'n' to cancel.${RESET}"
-      echo ""
-      read -rp "$(echo -e "${BOLD_BLUE}> ${RESET}")" NUM_MINERS
-      NUM_MINERS=$(echo "$NUM_MINERS" | tr -d '[:space:]')
-      if [[ "$NUM_MINERS" =~ ^[Nn]$ ]]; then
-        echo ""
-        echo -e "${CYAN}Returning to menu...${RESET}"
-        break
-      elif [[ "$NUM_MINERS" =~ ^[0-9]+$ && "$NUM_MINERS" -ge 1 ]]; then
-        # Prompt for max connections per miner
-        echo ""
-        echo -e "${YELLOW}Do you want to set a maximum number of connections per miner?${RESET}"
-        echo -e "${DIM}32 is often a safe value. Leave empty to skip this option.${RESET}"
-        echo ""
-        read -rp "$(echo -e "${BOLD_BLUE}> Enter value or press enter: ${RESET}")" MAX_ESTABLISHED
-        echo ""
-        # Prompt for peer mode
-        echo -e "${YELLOW}Select peer mode for these miners:${RESET}"
-        echo ""
-        echo -e "${CYAN}1) No peers (not recommended)${RESET}"
-        echo -e "${CYAN}2) Central node (all miners peer with miner1 only)${RESET}"
-        echo -e "${CYAN}3) Full mesh (all miners peer with each other)${RESET}"
-        echo -e "${CYAN}4) Custom peers (manual entry per miner)${RESET}"
-        echo ""
+
+      clear
+
+      if [[ "$LAUNCH_MODE" == "1" ]]; then
+        NUM_MINERS=$((miner_id - 1))
+        declare -A PER_MINER_THREADS
+        declare -A PER_MINER_STACK
+        declare -A PER_MINER_SYNCONLY
+
+        # Use recommended miner config as built above for all details
+        for i in $(seq 1 $NUM_MINERS); do
+          miner="miner$i"
+          mode="${miners_config[$i, "mode"]}"
+          threads="${miners_config[$i, "threads"]}"
+          stack="${miners_config[$i, "stack"]}"
+
+          [[ "$mode" == "sync-only" ]] && PER_MINER_SYNCONLY["$miner"]=1 || PER_MINER_SYNCONLY["$miner"]=0
+          PER_MINER_THREADS["$miner"]=$threads
+          PER_MINER_STACK["$miner"]=$stack
+        done
+      elif [[ "$LAUNCH_MODE" == "2" ]]; then
+        # --- Custom Miner Setup ---
         while true; do
-          read -rp "$(echo -e "${BOLD_BLUE}> Enter peer mode [1-4]: ${RESET}")" PEER_MODE
-          if [[ "$PEER_MODE" =~ ^[1-4]$ ]]; then
+          # Prompt FIRST for sync-only for miner 1
+          SYNC_ONLY_FIRST=0
+          echo -e ""
+          echo -e "${BOLD_YELLOW}Miner 1:${RESET}"
+          echo ""
+          echo -e "${YELLOW}(Recommended) Running your first miner as sync-only (no mining) helps ensure you always have a node that keeps up with the chain, regardless of mining load on other nodes.${RESET}"
+          echo ""
+          echo -e "${BOLD_BLUE}  ➤ Sync-only means:${RESET} This node will stay up-to-date with the chain but does not mine new blocks. This is usually the safest, most stable setup for your first node, especially on servers with many miners."
+          echo ""
+          echo -e "${BOLD_BLUE}  ➤ You can choose to mine with all your nodes if you wish, but having a dedicated sync-only node is strongly advised unless you have a specific reason not to.${RESET}"
+          echo ""
+          echo -e "${CYAN}💾 Why is this important?${RESET}"
+          echo -e "${DIM}  - The sync-only node is highly resilient and won’t crash due to mining. If a miner process fails, you always have a clean, synced node ready.${RESET}"
+          echo -e "${DIM}  - If you enable periodic state.jam backups (see Option 6 in the main menu), an automated backup will save the latest state.jam from the most up-to-date node every hour. This gives you a much better chance of having the very latest chain state ready for fast recovery if needed.${RESET}"
+          echo -e "${DIM}  - In case of a miner crash or server reboot, this lets you instantly recover—no long resync required, just restore the latest state.jam.${RESET}"
+          echo -e "${DIM}  - Even if all mining nodes fail, your sync-only node will help keep your data safe and ready for a quick restart.${RESET}"
+          echo ""
+          if confirm_yes_no "${BOLD_YELLOW}Run miner 1 in sync-only mode (no mining)?${RESET}"; then
+            SYNC_ONLY_FIRST=1
+          else
+            SYNC_ONLY_FIRST=0
+          fi
+          # Now prompt for number of miners
+          if [[ "$SYNC_ONLY_FIRST" == "1" ]]; then
+            echo ""
+            echo -e "${YELLOW}How many total miners do you want to run (including the sync-only node)?${RESET}"
+            echo -e "${DIM}You chose to run miner 1 as sync-only. For example, enter 2 for 1 sync-only node + 1 mining node.${RESET}"
+          else
+            echo ""
+            echo -e "${YELLOW}How many miners do you want to run?${RESET}"
+          fi
+          echo ""
+          echo -e "${DIM}Enter a number like 1, 3, 10... or type 'n' to cancel.${RESET}"
+          echo ""
+          read -rp "$(echo -e "${BOLD_BLUE}> ${RESET}")" NUM_MINERS
+          NUM_MINERS=$(echo "$NUM_MINERS" | tr -d '[:space:]')
+          if [[ "$NUM_MINERS" =~ ^[Nn]$ || -z "$NUM_MINERS" ]]; then
+            echo ""
+            echo -e "${CYAN}Returning to menu...${RESET}"
+            continue 2
+          elif [[ "$NUM_MINERS" =~ ^[0-9]+$ && "$NUM_MINERS" -ge 1 ]]; then
+            declare -A PER_MINER_SYNCONLY
+            declare -A PER_MINER_THREADS
+            declare -A PER_MINER_STACK
+            # Set sync-only for miner 1 based on earlier answer
+            if [[ "$SYNC_ONLY_FIRST" == "1" ]]; then
+              PER_MINER_SYNCONLY["miner1"]=1
+            else
+              PER_MINER_SYNCONLY["miner1"]=0
+            fi
+            # If miner 1 is sync-only, do NOT ask for threads or stack size.
+            if [[ "$SYNC_ONLY_FIRST" == "1" ]]; then
+              PER_MINER_THREADS["miner1"]=""
+              PER_MINER_STACK["miner1"]=""
+              echo -e "${CYAN}Miner 1 is sync-only: Using default thread, default stack.${RESET}"
+            else
+              echo ""
+              if confirm_yes_no "${YELLOW}Use multi-threading for miner 1?${RESET}"; then
+                while true; do
+                  echo -e "${YELLOW}How many threads for miner 1?${RESET}"
+                  read -rp "$(echo -e "${BOLD_BLUE}> ${RESET}")" THREADS
+                  if [[ "$THREADS" =~ ^[0-9]+$ && "$THREADS" -ge 1 ]]; then
+                    PER_MINER_THREADS["miner1"]=$THREADS
+                    break
+                  else
+                    echo ""
+                    echo -e "${RED}❌ Please enter a positive number.${RESET}"
+                    echo ""
+                  fi
+                done
+                # Strict stack size validation for miner 1
+                VALID_STACKS=(tiny small normal medium large huge)
+                while true; do
+                  echo -e "${YELLOW}Stack size for miner 1 (e.g. tiny/small/normal/medium/large/huge, or leave empty for default):${RESET}"
+                  echo -e "${DIM}tiny: 2GB, small: 4GB, normal: 8GB, medium: 16GB, large: 32GB, huge: 64GB${RESET}"
+                  read -rp "$(echo -e "${BOLD_BLUE}> ${RESET}")" STACKSIZE
+                  lower_stacksize=$(echo "$STACKSIZE" | awk '{print tolower($0)}')
+                  if [[ -z "$lower_stacksize" ]]; then
+                    STACKSIZE=""
+                    echo ""
+                    break
+                  fi
+                  valid=0
+                  for v in "${VALID_STACKS[@]}"; do
+                    if [[ "$lower_stacksize" == "$v" ]]; then
+                      STACKSIZE="$lower_stacksize"
+                      valid=1
+                      break
+                    fi
+                  done
+                  if [[ $valid -eq 1 ]]; then
+                    echo ""
+                    break
+                  else
+                    echo -e "${RED}❌ Invalid stack size. Please enter: tiny, small, normal, medium, large, huge, or leave empty.${RESET}"
+                  fi
+                done
+                PER_MINER_STACK["miner1"]=$STACKSIZE
+              else
+                PER_MINER_THREADS["miner1"]=1
+                PER_MINER_STACK["miner1"]=""
+                echo ""
+              fi
+            fi
+            # For other miners
+            for i in $(seq 2 $NUM_MINERS); do
+              echo ""
+              echo -e "${CYAN}Miner $i:${RESET}"
+              PER_MINER_SYNCONLY["miner$i"]=0
+              if confirm_yes_no "${YELLOW}Use multi-threading for miner $i?${RESET}"; then
+                while true; do
+                  echo -e "${YELLOW}How many threads for miner $i?${RESET}"
+                  read -rp "$(echo -e "${BOLD_BLUE}> ${RESET}")" THREADS
+                  if [[ "$THREADS" =~ ^[0-9]+$ && "$THREADS" -ge 1 ]]; then
+                    PER_MINER_THREADS["miner$i"]=$THREADS
+                    break
+                  else
+                    echo -e "${RED}❌ Please enter a positive number.${RESET}"
+                  fi
+                done
+                # Strict stack size validation for miner $i
+                VALID_STACKS=(tiny small normal medium large huge)
+                while true; do
+                  echo -e "${YELLOW}Stack size for miner $i (e.g. tiny/small/normal/medium/large/huge, or leave empty for default):${RESET}"
+                  echo -e "${DIM}tiny: 2GB, small: 4GB, normal: 8GB, medium: 16GB, large: 32GB, huge: 64GB${RESET}"
+                  read -rp "$(echo -e "${BOLD_BLUE}> ${RESET}")" STACKSIZE
+                  lower_stacksize=$(echo "$STACKSIZE" | awk '{print tolower($0)}')
+                  if [[ -z "$lower_stacksize" ]]; then
+                    STACKSIZE=""
+                    echo ""
+                    break
+                  fi
+                  valid=0
+                  for v in "${VALID_STACKS[@]}"; do
+                    if [[ "$lower_stacksize" == "$v" ]]; then
+                      STACKSIZE="$lower_stacksize"
+                      valid=1
+                      break
+                    fi
+                  done
+                  if [[ $valid -eq 1 ]]; then
+                    echo ""
+                    break
+                  else
+                    echo -e "${RED}❌ Invalid stack size. Please enter: tiny, small, normal, medium, large, huge, or leave empty.${RESET}"
+                  fi
+                done
+                PER_MINER_STACK["miner$i"]=$STACKSIZE
+              else
+                PER_MINER_THREADS["miner$i"]=""
+                PER_MINER_STACK["miner$i"]=""
+                echo ""
+              fi
+            done
+            echo ""
             break
           else
-            echo -e "${RED}❌ Invalid input. Enter 1, 2, 3, or 4.${RESET}"
+            echo ""
+            echo -e "${RED}❌ Invalid input. Please enter a positive number (e.g. 1, 3) or 'n' to cancel.${RESET}"
+            echo ""
           fi
         done
-        # Prompt for sync-only mode for miner1 if central node
-        if [[ "$PEER_MODE" == "2" ]]; then
-          echo ""
-          echo -e "${YELLOW}Do you want miner1 to run in sync-only mode (without mining)? (y/n)${RESET}"
-          while true; do
-            read -rp "$(echo -e "${BOLD_BLUE}> ${RESET}")" SYNC_ONLY_MINER1
-            [[ "$SYNC_ONLY_MINER1" =~ ^[YyNn]$ ]] && break
-            echo -e "${RED}❌ Please enter y or n.${RESET}"
-          done
-        fi
-        # Prompt for BASE_PORT if needed
-        if [[ "$PEER_MODE" == "2" || "$PEER_MODE" == "3" ]]; then
-          echo ""
-          echo -e "${YELLOW}Enter a base UDP port for miner communication (recommended: 40000):${RESET}"
-          read -rp "$(echo -e "${BOLD_BLUE}> ${RESET}")" BASE_PORT_INPUT
-          BASE_PORT_INPUT=$(echo "$BASE_PORT_INPUT" | tr -d '[:space:]')
-          if [[ -z "$BASE_PORT_INPUT" ]]; then
-            BASE_PORT=40000
-          elif ! [[ "$BASE_PORT_INPUT" =~ ^[0-9]+$ ]] || ((BASE_PORT_INPUT < 1024 || BASE_PORT_INPUT > 65000)); then
-            echo -e "${RED}❌ Invalid port. Using default 40000.${RESET}"
-            BASE_PORT=40000
-          else
-            BASE_PORT=$BASE_PORT_INPUT
-          fi
+      fi
+
+      # Build mining summary arrays and print config table
+      unset miners_config
+      declare -A miners_config
+
+      for i in $(seq 1 $NUM_MINERS); do
+        miner="miner$i"
+        mode="mining"
+        [[ "${PER_MINER_SYNCONLY[$miner]}" == "1" ]] && mode="sync-only"
+        miners_config[$i, "mode"]="$mode"
+        if [[ "$mode" == "sync-only" ]]; then
+          miners_config[$i, "threads"]="--"
+          miners_config[$i, "stack"]="--"
+          miners_config[$i, "ram"]="--"
         else
-          BASE_PORT=""
+          miners_config[$i, "threads"]="${PER_MINER_THREADS[$miner]}"
+          miners_config[$i, "stack"]="${PER_MINER_STACK[$miner]}"
+          # Map stack-size to RAM in GB
+          case "${PER_MINER_STACK[$miner]}" in
+          tiny) miners_config[$i, "ram"]=2 ;;
+          small) miners_config[$i, "ram"]=4 ;;
+          normal) miners_config[$i, "ram"]=8 ;;
+          medium) miners_config[$i, "ram"]=16 ;;
+          large) miners_config[$i, "ram"]=32 ;;
+          huge) miners_config[$i, "ram"]=64 ;;
+          "" | "default") miners_config[$i, "ram"]="--" ;;
+          *) miners_config[$i, "ram"]="--" ;;
+          esac
         fi
-        declare -A CUSTOM_PEERS_MAP
-        if [[ "$PEER_MODE" == "4" ]]; then
-          for i in $(seq 1 "$NUM_MINERS"); do
-            MINER_NAME="miner$i"
-            declare -a UNIQUE_PEERS=()
-            while true; do
-              echo -e "${YELLOW}Enter custom peer string(s) for ${CYAN}$MINER_NAME${YELLOW}, space-separated. Press Enter to finish:${RESET}"
-              read -rp "> " CUSTOM_PEERS
+      done
 
-              valid=()
-              invalid=()
+      echo ""
+      echo -e "${BOLD}${CYAN}═══════════════════════════════════════════════════════════════════════════════"
+      echo -e "            MINING CONFIGURATION SUMMARY"
+      echo -e "═══════════════════════════════════════════════════════════════════════════════${RESET}"
+      echo ""
+      printf "${BOLD_BLUE}%-10s %-10s %-10s %-15s %-15s %-10s${RESET}\n" "Miner" "Mode" "Threads" "Stack-size" "Stack RAM (GB)" "Flags"
+      for ((i = 1; i <= NUM_MINERS; i++)); do
+        miner="miner$i"
+        mode="${miners_config[$i, "mode"]}"
+        threads="${miners_config[$i, "threads"]}"
+        stack="${miners_config[$i, "stack"]}"
+        stack_ram="${miners_config[$i, "ram"]}"
+        flags=""
+        if [[ "$mode" == "sync-only" ]]; then
+          threads="--"
+          stack="--"
+          stack_ram="--"
+          flags="(sync)"
+        else
+          [[ -z "$threads" ]] && threads="default"
+          [[ -z "$stack" ]] && stack="default"
+          [[ -z "$stack_ram" ]] && stack_ram="--"
+          flags="--mine"
+        fi
+        printf "${CYAN}%-10s${RESET} %-10s %-10s %-15s %-15s %-10s\n" "$miner" "$mode" "$threads" "$stack" "$stack_ram" "$flags"
+      done
+      echo ""
+      echo -e "${BOLD}${CYAN}═══════════════════════════════════════════════════════════════════════════════${RESET}\n"
+      echo ""
+      echo ""
+      confirm_yes_no "Proceed with this config?" || {
+        echo ""
+        echo -e "${CYAN}Returning to menu...${RESET}"
+        echo ""
+        continue
+      }
 
-              for peer in $CUSTOM_PEERS; do
-                if [[ "$peer" =~ ^--peer\ /ip4/[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/udp/[0-9]+/quic-v1$ ]]; then
-                  duplicate=0
-                  for up in "${UNIQUE_PEERS[@]}"; do
-                    [[ "$peer" == "$up" ]] && duplicate=1 && break
-                  done
-                  if [[ $duplicate -eq 0 ]]; then
-                    valid+=("$peer")
-                    UNIQUE_PEERS+=("$peer")
-                  fi
-                else
-                  invalid+=("$peer")
+      clear
+
+      # Banner Step 3/4: Network Config
+      strip_ansi() {
+        echo -e "$1" | sed 's/\x1b\[[0-9;]*m//g'
+      }
+      BANNER_TITLE="Step 3/4: Network Config"
+      BANNER_PADDING=4
+      banner_title_len=${#BANNER_TITLE}
+      banner_inner_width=$((banner_title_len + BANNER_PADDING * 2))
+      [[ $banner_inner_width -lt 80 ]] && banner_inner_width=80
+      # Top border
+      echo -e "${BOLD_BLUE}╔$(printf '═%.0s' $(seq 1 $banner_inner_width))╗${RESET}"
+      # Centered title
+      pad_total=$((banner_inner_width - banner_title_len))
+      pad_left=$((pad_total / 2))
+      pad_right=$((pad_total - pad_left))
+      printf "${BOLD_BLUE}║%*s%s%*s║${RESET}\n" $pad_left "" "$BANNER_TITLE" $pad_right ""
+      # Bottom border
+      echo -e "${BOLD_BLUE}╚$(printf '═%.0s' $(seq 1 $banner_inner_width))╝${RESET}"
+      echo -e ""
+
+      # Configure and enable required UFW firewall rules for Nockchain
+      echo ""
+      echo -e ""
+      echo -e "${CYAN}\e[1m▶ Configuring firewall...${RESET}"
+      sudo ufw allow ssh >/dev/null 2>&1 || true
+      sudo ufw allow 22 >/dev/null 2>&1 || true
+      sudo ufw allow 3005/tcp >/dev/null 2>&1 || true
+      sudo ufw allow 3006/tcp >/dev/null 2>&1 || true
+      sudo ufw allow 3005/udp >/dev/null 2>&1 || true
+      sudo ufw allow 3006/udp >/dev/null 2>&1 || true
+      sudo ufw --force enable >/dev/null 2>&1 || echo -e "${YELLOW}Warning: Failed to enable UFW. Continuing script execution.${RESET}"
+      echo -e "${GREEN}✅ Firewall configured.${RESET}"
+      echo -e ""
+
+      # Prompt for max connections per miner
+      echo ""
+      echo -e "${YELLOW}Do you want to set a maximum number of connections per miner?${RESET}"
+      echo -e ""
+      echo -e "${DIM}32 is often a safe value. Leave empty to skip this option.${RESET}"
+      echo ""
+      read -rp "$(echo -e "${BOLD_BLUE}> Enter value or press enter: ${RESET}")" MAX_ESTABLISHED
+
+      # Prompt for peer mode
+      echo ""
+      echo -e "${YELLOW}Select peer mode for these miners:${RESET}"
+      echo ""
+      echo -e "${CYAN}1) No peers (not recommended)${RESET}"
+      echo -e "${CYAN}2) Central node (all miners peer with miner1 only)${RESET}"
+      echo -e "${CYAN}3) Full mesh (all miners peer with each other)${RESET}"
+      echo -e "${CYAN}4) Custom peers (manual entry per miner)${RESET}"
+      echo ""
+      while true; do
+        read -rp "$(echo -e "${BOLD_BLUE}> Enter peer mode [1-4]: ${RESET}")" PEER_MODE
+        if [[ "$PEER_MODE" =~ ^[1-4]$ ]]; then
+          break
+        else
+          echo -e ""
+          echo -e "${RED}❌ Invalid input. Enter 1, 2, 3, or 4.${RESET}"
+          echo -e ""
+        fi
+      done
+
+      # Prompt for BASE_PORT if needed
+      if [[ "$PEER_MODE" == "2" || "$PEER_MODE" == "3" ]]; then
+        echo ""
+        echo -e "${YELLOW}Enter a base UDP port for miner communication (recommended: 40000):${RESET}"
+        echo ""
+        read -rp "$(echo -e "${BOLD_BLUE}> ${RESET}")" BASE_PORT_INPUT
+        BASE_PORT_INPUT=$(echo "$BASE_PORT_INPUT" | tr -d '[:space:]')
+        if [[ -z "$BASE_PORT_INPUT" ]]; then
+          BASE_PORT=40000
+        elif ! [[ "$BASE_PORT_INPUT" =~ ^[0-9]+$ ]] || ((BASE_PORT_INPUT < 1024 || BASE_PORT_INPUT > 65000)); then
+          echo -e ""
+          echo -e "${RED}❌ Invalid port. Using default 40000.${RESET}"
+          echo -e ""
+          BASE_PORT=40000
+        else
+          BASE_PORT=$BASE_PORT_INPUT
+        fi
+      else
+        BASE_PORT=""
+      fi
+      declare -A CUSTOM_PEERS_MAP
+      if [[ "$PEER_MODE" == "4" ]]; then
+        for i in $(seq 1 "$NUM_MINERS"); do
+          MINER_NAME="miner$i"
+          declare -a UNIQUE_PEERS=()
+          while true; do
+            echo -e "${YELLOW}Enter custom peer string(s) for ${CYAN}$MINER_NAME${YELLOW}, space-separated. Press Enter to finish:${RESET}"
+            read -rp "> " CUSTOM_PEERS
+
+            valid=()
+            invalid=()
+
+            for peer in $CUSTOM_PEERS; do
+              if [[ "$peer" =~ ^--peer\ /ip4/[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/udp/[0-9]+/quic-v1$ ]]; then
+                duplicate=0
+                for up in "${UNIQUE_PEERS[@]}"; do
+                  [[ "$peer" == "$up" ]] && duplicate=1 && break
+                done
+                if [[ $duplicate -eq 0 ]]; then
+                  valid+=("$peer")
+                  UNIQUE_PEERS+=("$peer")
                 fi
-              done
+              else
+                invalid+=("$peer")
+              fi
+            done
 
+            echo ""
+            echo -e "${GREEN}✅ Accepted peers:${RESET}"
+            for p in "${UNIQUE_PEERS[@]}"; do
+              echo "  $p"
+            done
+
+            if [[ ${#invalid[@]} -gt 0 ]]; then
               echo ""
-              echo -e "${GREEN}✅ Accepted peers:${RESET}"
-              for p in "${UNIQUE_PEERS[@]}"; do
+              echo -e "${RED}❌ Invalid format skipped:${RESET}"
+              for p in "${invalid[@]}"; do
                 echo "  $p"
               done
-
-              if [[ ${#invalid[@]} -gt 0 ]]; then
-                echo ""
-                echo -e "${RED}❌ Invalid format skipped:${RESET}"
-                for p in "${invalid[@]}"; do
-                  echo "  $p"
-                done
-              fi
-
-              echo ""
-              echo -e "${YELLOW}Press Enter to confirm this list, or type more peers:${RESET}"
-              read -rp "> " CONTINUE_INPUT
-              [[ -z "$CONTINUE_INPUT" ]] && break
-            done
-
-            if [[ ${#UNIQUE_PEERS[@]} -eq 0 ]]; then
-              CUSTOM_PEERS_MAP["$MINER_NAME"]=""
-            else
-              CUSTOM_PEERS_MAP["$MINER_NAME"]="${UNIQUE_PEERS[*]}"
             fi
+
+            echo ""
+            echo -e "${YELLOW}Press Enter to confirm this list, or type more peers:${RESET}"
+            read -rp "> " CONTINUE_INPUT
+            [[ -z "$CONTINUE_INPUT" ]] && break
           done
-        fi
-        # Create launch.cfg before preview so it can be shown to the user
-        LAUNCH_CFG="$SCRIPT_DIR/launch.cfg"
-        # Compute PEER_FLAGs for all miners
-        declare -A PEER_FLAG_MAP
-        if [[ "$PEER_MODE" == "1" ]]; then
-          for i in $(seq 1 "$NUM_MINERS"); do
-            PEER_FLAG_MAP["miner$i"]=""
-          done
-        elif [[ "$PEER_MODE" == "2" ]]; then
-          for i in $(seq 1 "$NUM_MINERS"); do
-            if [[ "$i" == "1" ]]; then
-              PEER_FLAG_MAP["miner$i"]=""
-            else
-              PEER_FLAG_MAP["miner$i"]="--peer /ip4/127.0.0.1/udp/$((BASE_PORT + 1))/quic-v1"
-            fi
-          done
-        elif [[ "$PEER_MODE" == "3" ]]; then
-          for i in $(seq 1 "$NUM_MINERS"); do
-            peers=()
-            for j in $(seq 1 "$NUM_MINERS"); do
-              [[ "$j" == "$i" ]] && continue
-              peers+=("--peer /ip4/127.0.0.1/udp/$((BASE_PORT + j))/quic-v1")
-            done
-            PEER_FLAG_MAP["miner$i"]="${peers[*]}"
-          done
-        elif [[ "$PEER_MODE" == "4" ]]; then
-          for i in $(seq 1 "$NUM_MINERS"); do
-            MINER_NAME="miner$i"
-            PEER_FLAG_MAP["$MINER_NAME"]="${CUSTOM_PEERS_MAP[$MINER_NAME]}"
-          done
-        fi
-        # Compute BIND_FLAGs for all miners, similar to PEER_FLAG_MAP logic
-        declare -A BIND_FLAG_MAP
-        if [[ "$PEER_MODE" == "2" || "$PEER_MODE" == "3" ]]; then
-          for i in $(seq 1 "$NUM_MINERS"); do
-            BIND_FLAG_MAP["miner$i"]="--bind /ip4/0.0.0.0/udp/$((BASE_PORT + i))/quic-v1"
-          done
-        fi
-        # Compute MAX_ESTABLISHED_FLAG for all miners
-        declare -A MAX_ESTABLISHED_FLAG_MAP
-        for i in $(seq 1 "$NUM_MINERS"); do
-          MINER_NAME="miner$i"
-          if [[ -n "$MAX_ESTABLISHED" ]]; then
-            MAX_ESTABLISHED_FLAG_MAP["$MINER_NAME"]="--max-established $MAX_ESTABLISHED"
+
+          if [[ ${#UNIQUE_PEERS[@]} -eq 0 ]]; then
+            CUSTOM_PEERS_MAP["$MINER_NAME"]=""
           else
-            MAX_ESTABLISHED_FLAG_MAP["$MINER_NAME"]=""
+            CUSTOM_PEERS_MAP["$MINER_NAME"]="${UNIQUE_PEERS[*]}"
           fi
         done
-        {
-          # Write BASE_PORT if set
-          [[ -n "$BASE_PORT" ]] && echo "BASE_PORT=$BASE_PORT"
-          for i in $(seq 1 "$NUM_MINERS"); do
-            MINER_NAME="miner$i"
-            echo ""
-            echo "[$MINER_NAME]"
-            [[ "$i" == "1" && "$SYNC_ONLY_MINER1" =~ ^[Yy]$ ]] && echo "MINE_FLAG=" || echo "MINE_FLAG=--mine"
-            echo "MINING_KEY=$MINING_KEY"
-            echo "BIND_FLAG=${BIND_FLAG_MAP[$MINER_NAME]:-}"
-            echo "PEER_FLAG=${PEER_FLAG_MAP[$MINER_NAME]:-}"
-            echo "MAX_ESTABLISHED_FLAG=${MAX_ESTABLISHED_FLAG_MAP[$MINER_NAME]:-}"
-            if [[ "$PEER_MODE" == "2" && "$i" -gt 1 ]]; then
-              echo "EXTRA_FLAGS="
-            else
-              echo "EXTRA_FLAGS="
-            fi
-            echo "STATE_FLAG=--state-jam ../state.jam"
+      fi
+
+      # Create launch.cfg before preview so it can be shown to the user
+      LAUNCH_CFG="$SCRIPT_DIR/launch.cfg"
+
+      # Compute PEER_FLAGs for all miners
+      declare -A PEER_FLAG_MAP
+      if [[ "$PEER_MODE" == "1" ]]; then
+        for i in $(seq 1 "$NUM_MINERS"); do
+          PEER_FLAG_MAP["miner$i"]=""
+        done
+      elif [[ "$PEER_MODE" == "2" ]]; then
+        # Central node: miner1 is central, no peer flag for miner1; others peer to miner1
+        for i in $(seq 1 "$NUM_MINERS"); do
+          if [[ "$i" == "1" ]]; then
+            PEER_FLAG_MAP["miner$i"]=""
+          else
+            PEER_FLAG_MAP["miner$i"]="--peer /ip4/127.0.0.1/udp/$((BASE_PORT + 1))/quic-v1"
+          fi
+        done
+      elif [[ "$PEER_MODE" == "3" ]]; then
+        for i in $(seq 1 "$NUM_MINERS"); do
+          peers=()
+          for j in $(seq 1 "$NUM_MINERS"); do
+            [[ "$j" == "$i" ]] && continue
+            peers+=("--peer /ip4/127.0.0.1/udp/$((BASE_PORT + j))/quic-v1")
           done
-        } >"$LAUNCH_CFG"
-        echo ""
-        # Show the miners to be launched
-        echo -e ""
-        echo -e "${BOLD_BLUE}${CYAN}⚙️  Miner Configuration${RESET}"
-        echo -e "${DIM}──────────────────────────────────────────────${RESET}"
-        if [[ -f "$LAUNCH_CFG" ]]; then
-          cat "$LAUNCH_CFG"
-        else
-          echo -e "${RED}❌ Configuration file not found.${RESET}"
-        fi
-        echo -e "${DIM}──────────────────────────────────────────────${RESET}"
-        echo ""
-        echo -e "${BOLD_BLUE}${CYAN}🔧 Launch Preview${RESET}"
-        printf "  ${CYAN}%-10s %-22s %-22s${RESET}\n" "Miner" "Systemd Service" "Run Command"
+          PEER_FLAG_MAP["miner$i"]="${peers[*]}"
+        done
+      elif [[ "$PEER_MODE" == "4" ]]; then
         for i in $(seq 1 "$NUM_MINERS"); do
           MINER_NAME="miner$i"
-          DIR="$NOCKCHAIN_HOME/$MINER_NAME"
-          SERVICE="nockchain-miner$i.service"
-          RUN_CMD="cd $DIR && exec run_miner.sh $i"
-          printf "  ${BOLD_BLUE}%-10s${RESET} %-22s %-22s\n" "$MINER_NAME" "$SERVICE" "$RUN_CMD"
+          PEER_FLAG_MAP["$MINER_NAME"]="${CUSTOM_PEERS_MAP[$MINER_NAME]}"
         done
-        echo ""
-        confirm_yes_no "Start nockchain miner(s)?" || {
-          echo -e "${CYAN}Returning to menu...${RESET}"
-          continue
-        }
-        echo -e "${GREEN}Proceeding with miner launch...${RESET}"
-        echo ""
-        echo -e "${GREEN}📁 Configuration saved to: $LAUNCH_CFG${RESET}"
-        echo -e "${CYAN}🧠 Managed by: launch.cfg (edit this file to change peer mode, state file, or flags)${RESET}"
-        for i in $(seq 1 "$NUM_MINERS"); do
-          MINER_DIR="$NOCKCHAIN_HOME/miner$i"
-          mkdir -p "$MINER_DIR"
-          generate_systemd_service $i
-          start_miner_service $i
-        done
-        echo ""
-        echo -e "${GREEN}\e[1m🎉 Success:${RESET}${GREEN} Nockchain miners launched via systemd!${RESET}"
-        echo ""
-        echo -e "${CYAN}  Manage your miners with the following commands:${RESET}"
-        echo -e "${CYAN}    - Status:   ${DIM}systemctl status nockchain-minerX${RESET}"
-        echo -e "${CYAN}    - Logs:     ${DIM}tail -f $NOCKCHAIN_HOME/minerX/minerX.log${RESET}"
-        echo -e "${CYAN}    - Stop:     ${DIM}sudo systemctl stop nockchain-minerX${RESET}"
-        echo -e "${CYAN}    - Start:    ${DIM}sudo systemctl start nockchain-minerX${RESET}"
-        echo ""
-        echo -e "${YELLOW}Press any key to return to the main menu...${RESET}"
-        read -n 1 -s
-        break
-      else
-        echo -e "${RED}❌ Invalid input. Please enter a positive number (e.g. 1, 3) or 'n' to cancel.${RESET}"
       fi
+
+      # Compute BIND_FLAGs for all miners, similar to PEER_FLAG_MAP logic
+      declare -A BIND_FLAG_MAP
+      if [[ "$PEER_MODE" == "2" || "$PEER_MODE" == "3" ]]; then
+        for i in $(seq 1 "$NUM_MINERS"); do
+          BIND_FLAG_MAP["miner$i"]="--bind /ip4/0.0.0.0/udp/$((BASE_PORT + i))/quic-v1"
+        done
+      fi
+
+      # Compute MAX_ESTABLISHED_FLAG for all miners
+      declare -A MAX_ESTABLISHED_FLAG_MAP
+      for i in $(seq 1 "$NUM_MINERS"); do
+        MINER_NAME="miner$i"
+        if [[ -n "$MAX_ESTABLISHED" ]]; then
+          MAX_ESTABLISHED_FLAG_MAP["$MINER_NAME"]="--max-established $MAX_ESTABLISHED"
+        else
+          MAX_ESTABLISHED_FLAG_MAP["$MINER_NAME"]=""
+        fi
+      done
+
+      # Compute NUM_THREADS_FLAG for all miners
+      declare -A NUM_THREADS_FLAG_MAP
+      for i in $(seq 1 "$NUM_MINERS"); do
+        MINER_NAME="miner$i"
+        THREADS="${PER_MINER_THREADS[$MINER_NAME]}"
+        MODE="${PER_MINER_SYNCONLY[$MINER_NAME]}"
+        if [[ "$MODE" == "1" ]]; then
+          NUM_THREADS_FLAG_MAP["$MINER_NAME"]=""
+        elif [[ -n "$THREADS" ]]; then
+          NUM_THREADS_FLAG_MAP["$MINER_NAME"]="--num-threads $THREADS"
+        else
+          NUM_THREADS_FLAG_MAP["$MINER_NAME"]=""
+        fi
+      done
+
+      # Compute PER_MINER_STACK_MAP for all miners
+      declare -A PER_MINER_STACK_MAP
+      for i in $(seq 1 "$NUM_MINERS"); do
+        MINER_NAME="miner$i"
+        STACK="${PER_MINER_STACK[$MINER_NAME]}"
+        if [[ -n "$STACK" ]]; then
+          PER_MINER_STACK_MAP["$MINER_NAME"]="--stack-size $STACK"
+        else
+          PER_MINER_STACK_MAP["$MINER_NAME"]=""
+        fi
+      done
+
+      {
+        # Write BASE_PORT if set
+        [[ -n "$BASE_PORT" ]] && echo "BASE_PORT=$BASE_PORT"
+        for i in $(seq 1 "$NUM_MINERS"); do
+          MINER_NAME="miner$i"
+          echo ""
+          echo "[$MINER_NAME]"
+          if [[ "${PER_MINER_SYNCONLY[$MINER_NAME]}" == "1" ]]; then
+            echo "MINE_FLAG="
+          else
+            echo "MINE_FLAG=--mine"
+          fi
+          echo "MINING_KEY=$MINING_KEY"
+          echo "BIND_FLAG=${BIND_FLAG_MAP[$MINER_NAME]:-}"
+          echo "PEER_FLAG=${PEER_FLAG_MAP[$MINER_NAME]:-}"
+          echo "MAX_ESTABLISHED_FLAG=${MAX_ESTABLISHED_FLAG_MAP[$MINER_NAME]:-}"
+          echo "NUM_THREADS_FLAG=${NUM_THREADS_FLAG_MAP[$MINER_NAME]:-}"
+          echo "PER_MINER_STACK_FLAG=${PER_MINER_STACK_MAP[$MINER_NAME]:-}"
+          echo "EXTRA_FLAGS="
+          echo "STATE_FLAG=--state-jam ../state.jam"
+        done
+      } >"$LAUNCH_CFG"
+      echo -e ""
+      echo -e "${GREEN}📁 Configuration saved to: $LAUNCH_CFG${RESET}"
+
+    fi
+
+    clear
+
+    # Banner Step 4/4: Final Preview
+    strip_ansi() {
+      echo -e "$1" | sed 's/\x1b\[[0-9;]*m//g'
+    }
+    BANNER_TITLE="Final Preview"
+    BANNER_PADDING=4
+    banner_title_len=${#BANNER_TITLE}
+    banner_inner_width=$((banner_title_len + BANNER_PADDING * 2))
+    [[ $banner_inner_width -lt 80 ]] && banner_inner_width=80
+    # Top border
+    echo -e "${BOLD_BLUE}╔$(printf '═%.0s' $(seq 1 $banner_inner_width))╗${RESET}"
+    # Centered title
+    pad_total=$((banner_inner_width - banner_title_len))
+    pad_left=$((pad_total / 2))
+    pad_right=$((pad_total - pad_left))
+    printf "${BOLD_BLUE}║%*s%s%*s║${RESET}\n" $pad_left "" "$BANNER_TITLE" $pad_right ""
+    # Bottom border
+    echo -e "${BOLD_BLUE}╚$(printf '═%.0s' $(seq 1 $banner_inner_width))╝${RESET}"
+    echo -e ""
+
+    # Check launch.cfg
+    if [[ -f "$LAUNCH_CFG" ]]; then
+      cat "$LAUNCH_CFG"
+    else
+      echo -e "${RED}❌ Configuration file not found.${RESET}"
+    fi
+
+    echo -e ""
+    echo -e "${BOLD_BLUE}${CYAN}═══════════════════════════════════════════════════════════════════════════════${RESET}"
+    echo -e ""
+    echo -e "${BOLD_BLUE}${CYAN}═══════════════════════════════════════════════════════════════════════════════"
+    echo -e "            LAUNCH PREVIEW"
+    echo -e "═══════════════════════════════════════════════════════════════════════════════${RESET}"
+    echo -e ""
+    printf "  ${CYAN}%-10s %-22s %-22s${RESET}\n" "Miner" "Systemd Service" "Run Command"
+    for i in $(seq 1 "$NUM_MINERS"); do
+      MINER_NAME="miner$i"
+      DIR="$NOCKCHAIN_HOME/$MINER_NAME"
+      SERVICE="nockchain-miner$i.service"
+      RUN_CMD="cd $DIR && exec run_miner.sh $i"
+      printf "  ${BOLD_BLUE}%-10s${RESET} %-22s %-22s\n" "$MINER_NAME" "$SERVICE" "$RUN_CMD"
     done
+    echo ""
+    echo -e "${BOLD_BLUE}${CYAN}═══════════════════════════════════════════════════════════════════════════════${RESET}"
+    echo -e ""
+
+    # Ensure Nockchain binary exists and is executable
+    require_nockchain "You must have a valid Nockchain binary before launching miners." || continue
+    ensure_nockchain_executable
+
+    echo -e "${BOLD}${CYAN}You're ready to launch your Nockchain miners!${RESET}"
+    echo -e "${CYAN}All selected miners will be launched using the above configuration."
+    echo ""
+
+    if ! confirm_yes_no "${BOLD_YELLOW}Start Nockchain miner(s) with this configuration?${RESET}"; then
+      echo -e ""
+      echo -e "${YELLOW}Action cancelled. No miners launched.${RESET}"
+      echo -e "${CYAN}Press Enter to return to the main menu...${RESET}"
+      read -r
+      continue
+    fi
+    echo -e ""
+    echo -e "${GREEN}Proceeding with miner launch...${RESET}"
+    echo -e ""
+    echo -e "${CYAN}🧠 Power user tip: You can edit advanced miner options at any time!${RESET}"
+    echo -e "${CYAN}   To customize peer mode, network ports, state.jam path, thread counts, stack size, mining flags, or any extra arguments, just open your launch config:${RESET}"
+    echo -e "${BOLD_BLUE}   $LAUNCH_CFG${RESET}"
+    echo -e "${DIM}   (Any changes here will apply the next time you launch or restart miners.)${RESET}"
+    echo -e ""
+    for i in $(seq 1 "$NUM_MINERS"); do
+      MINER_DIR="$NOCKCHAIN_HOME/miner$i"
+      mkdir -p "$MINER_DIR"
+      generate_systemd_service $i
+      start_miner_service $i
+    done
+    echo ""
+    echo -e "${GREEN}\e[1m🎉 Success:${RESET}${GREEN} Nockchain miners launched via systemd!${RESET}"
+    echo ""
+    echo -e "${CYAN}  Manage your miners with the following commands:${RESET}"
+    echo -e "${CYAN}    - Status:   ${DIM}systemctl status nockchain-minerX${RESET}"
+    echo -e "${CYAN}    - Logs:     ${DIM}tail -f $NOCKCHAIN_HOME/minerX/minerX.log${RESET}"
+    echo -e "${CYAN}    - Stop:     ${DIM}sudo systemctl stop nockchain-minerX${RESET}"
+    echo -e "${CYAN}    - Start:    ${DIM}sudo systemctl start nockchain-minerX${RESET}"
+    echo ""
+    echo -e "${YELLOW}Press any key to return to the main menu...${RESET}"
+    read -n 1 -s
     continue
     ;;
 
@@ -2754,7 +3269,11 @@ EOS
     # Diagnostics: Check for Nockchain and wallet binary presence
     echo -e "${CYAN}▶ Key Paths & Binaries${RESET}"
     echo -e "${DIM}----------------------${RESET}"
-    [[ -x "$NOCKCHAIN_BIN" ]] && echo -e "${GREEN}✔ nockchain binary present${RESET}" || echo -e "${RED}❌ nockchain binary missing${RESET}"
+    if require_nockchain ""; then
+      echo -e "${GREEN}✔ nockchain binary present${RESET}"
+    else
+      echo -e "${RED}❌ nockchain binary missing${RESET}"
+    fi
     [[ -x "$HOME/.cargo/bin/nockchain-wallet" ]] && echo -e "${GREEN}✔ nockchain-wallet present${RESET}" || echo -e "${RED}❌ nockchain-wallet missing${RESET}"
     echo ""
 
@@ -2856,6 +3375,7 @@ EOS
   # ===== Main Menu Option 23 =====
   23)
     clear
+    ensure_fzf_installed
     while true; do
       echo -e "${CYAN}Edit Launcher Settings${RESET}"
       echo ""
