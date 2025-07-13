@@ -642,7 +642,7 @@ update_proof_attempts_log() {
   fi
 
   # Use sed to remove ANSI codes, then grep for "starting proving attempt", skipping sync/inactive, and append new entries
-  sed 's/\x1B\[[0-9;]*m//g' "$LOG_FILE" | \
+  sed 's/\x1B\[[0-9;]*m//g' "$LOG_FILE" |
     awk -v last_line="$last_csv_line" '
       /starting proving attempt/ && !/sync/i && !/inactive/i { line[++n] = $0 }
       END {
@@ -1362,39 +1362,42 @@ EOF
       clear
       # Fetch Filebin metadata
       TMP_FILEBIN_META="/tmp/statebin-uploads.txt"
-      curl -fsSL "https://raw.githubusercontent.com/jobless0x/nockchain-launcher/main/statebin-uploads.txt" -o "$TMP_FILEBIN_META"
+      FILEBIN_META_URL="https://raw.githubusercontent.com/jobless0x/nockchain-launcher/main/statebin-uploads.txt"
+      curl -fsSL "$FILEBIN_META_URL" -o "$TMP_FILEBIN_META"
+      # Clean the metadata file: remove blank lines and trailing commas
+      sed -i '/^$/d; s/,$//' "$TMP_FILEBIN_META"
       if [[ ! -s "$TMP_FILEBIN_META" ]]; then
         echo -e "${RED}Error: Failed to download statebin-uploads.txt or file is empty${RESET}"
         read -n 1 -s -r -p $'\nPress any key to return to the main menu...'
         continue
       fi
 
-      # Parse Filebin meta
+      # Parse Filebin meta using pipe-based parsing for robustness
+      FILEBIN_META_URL="https://raw.githubusercontent.com/jobless0x/nockchain-launcher/main/statebin-uploads.txt"
+      jam_file_time=$(curl -fsSL "$FILEBIN_META_URL" | sed 's/\r//g; /^$/d; s/ *| */|/g' | awk -F'|' '{ gsub(/.jam/, "", $2); gsub(/[^0-9]/, "", $2); block=$2; time=$1 } END { print block, time }')
+
+      # Extract block number and timestamp
+      block=$(echo "$jam_file_time" | awk '{print $1}')
+      timestamp=$(echo "$jam_file_time" | cut -d' ' -f2-)
+      filebin_filename=""
+      filebin_upload_time=""
+      if [[ -n "$block" && -n "$timestamp" ]]; then
+        filebin_filename="${block}.jam"
+        filebin_upload_time="$timestamp"
+      fi
+
+      # Also extract last line for URL and extra info
       RAW_LINE=$(tail -n 1 "$TMP_FILEBIN_META")
       PARSED_LINE=$(echo "$RAW_LINE" | tr -d '\000' | tr -cd '\11\12\15\40-\176' | sed 's/^[ \t]*//;s/[ \t]*$//')
       CLEANED_LINE=$(echo "$PARSED_LINE" | tr -d '\000')
-      IFS='|' read filebin_dt filebin_filename filebin_url <<<"$CLEANED_LINE"
+      IFS='|' read filebin_dt filebin_filename_raw filebin_url <<<"$CLEANED_LINE"
       filebin_dt=$(echo "$filebin_dt" | xargs)
-      filebin_filename=$(echo "$filebin_filename" | xargs)
+      filebin_filename_raw=$(echo "$filebin_filename_raw" | xargs)
       filebin_url=$(echo "$filebin_url" | xargs)
-
-      # Check Filebin URL
       filebin_url=$(echo "$filebin_url" | tr -d '\r\n' | sed 's/[[:space:]]*$//')
-      if [[ -z "$filebin_url" ]]; then
-        echo -e "${RED}Error: Missing URL in statebin-uploads.txt${RESET}"
-        tail -n 1 "$TMP_FILEBIN_META"
-        read -n 1 -s -r -p $'\nPress any key to return to the main menu...'
-        continue
-      fi
-      if ! echo "$filebin_url" | grep -qE '^https?://'; then
-        echo -e "${RED}Error: URL ($filebin_url) does not match expected pattern${RESET}"
-        read -n 1 -s -r -p $'\nPress any key to return to the main menu...'
-        continue
-      fi
-      filebin_date=$(echo "$filebin_dt" | cut -d' ' -f1)
-      filebin_time=$(echo "$filebin_dt" | cut -d' ' -f2)
-      # Get numeric and dotted block
-      filebin_block_numeric=$(echo "$filebin_filename" | grep -oE '[0-9]+' | head -n 1)
+
+      # Get numeric and dotted block for display
+      filebin_block_numeric=$(echo "$block" | grep -oE '[0-9]+' | head -n 1)
       filebin_block_dot=""
       if [[ "$filebin_block_numeric" =~ ^[0-9]+$ ]]; then
         block_len=${#filebin_block_numeric}
@@ -1412,69 +1415,23 @@ EOF
       echo -e "${CYAN}Latest Filebin snapshot:${RESET}"
       echo -e "  Block:   ${YELLOW}$filebin_block_dot${RESET}"
       echo -e "  File:    ${YELLOW}$filebin_filename${RESET}"
-      echo -e "  Uploaded:${YELLOW}$filebin_dt${RESET}"
+      echo -e "  Uploaded:${YELLOW}$timestamp${RESET}"
       echo -e "  URL:     ${CYAN}$filebin_url${RESET}"
 
       # Parse upload time
-      filebin_epoch=$(date -d "$filebin_dt" +%s 2>/dev/null || echo 0)
+      filebin_epoch=$(date -d "$timestamp" +%s 2>/dev/null || echo 0)
 
-      # Fetch Filebin HTML
-      TMP_FILEBIN_HTML="/tmp/filebin.html"
-      curl -sL 'https://filebin.net/joblessnock/?show=true' >"$TMP_FILEBIN_HTML"
-
-      # Parse .jam names/times
-      declare -A jam_file_time
-      while read -r fname ftime; do
-        jam_file_time["$fname"]="$ftime"
-      done < <(
-        awk '
-          /<tr>/ {row="";inrow=1}
-          /<\/tr>/ {inrow=0; row=row $0 "\n";
-            if (row ~ /\.jam/ && row ~ /[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}/) {
-              match(row, /([0-9]+\.jam)/, fname)
-              match(row, /([0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2})/, ftime)
-              print fname[1], ftime[1]
-            }
-          }
-          /<tr>/,/<\/tr>/ {row=row $0 "\n"}
-        ' "$TMP_FILEBIN_HTML"
-      )
-
-      # Get latest .jam file
-      if ((${#jam_file_time[@]} > 0)); then
-        filebin_filename=$(printf '%s\n' "${!jam_file_time[@]}" | sort -n | tail -n1)
-        filebin_upload_time="${jam_file_time[$filebin_filename]}"
-      else
-        filebin_filename=""
-        filebin_upload_time=""
-      fi
-
-      # Abort if parse fails
-      if [[ -z "$filebin_filename" || -z "$filebin_upload_time" ]]; then
-        echo -e "${RED}❌ Could not parse Filebin HTML for .jam files. Aborting.${RESET}"
+      # Sanity checks
+      if [[ -z "$filebin_url" ]]; then
+        echo -e "${RED}Error: Missing URL in statebin-uploads.txt${RESET}"
+        tail -n 1 "$TMP_FILEBIN_META"
         read -n 1 -s -r -p $'\nPress any key to return to the main menu...'
         continue
       fi
-
-      # Check upload time
-      filebin_epoch=$(date -d "$filebin_dt" +%s 2>/dev/null || echo 0)
-      if [[ -n "$filebin_upload_time" ]]; then
-        filebin_uploaded_epoch=$(date -d "$filebin_upload_time" +%s 2>/dev/null || echo 0)
-      else
-        filebin_uploaded_epoch=0
-      fi
-      if [[ "$filebin_uploaded_epoch" -gt 0 && "$filebin_epoch" -gt 0 ]]; then
-        time_diff_min=$(((filebin_epoch - filebin_uploaded_epoch) / 60))
-        abs_time_diff_min=${time_diff_min#-}
-        if ((abs_time_diff_min > 10)); then
-          echo -e ""
-          echo -e "${RED}❌ Filebin file upload time and GitHub .txt record differ by >10 minutes!${RESET}"
-          read -n 1 -s -r -p $'\nPress any key to return to the main menu...'
-          continue
-        fi
-        echo -e "${GREEN}Filebin upload time matches GitHub record (diff: ${abs_time_diff_min} min).${RESET}"
-      else
-        echo -e "${YELLOW}⚠️  Could not validate Filebin upload time. Proceed with caution.${RESET}"
+      if ! echo "$filebin_url" | grep -qE '^https?://'; then
+        echo -e "${RED}Error: URL ($filebin_url) does not match expected pattern${RESET}"
+        read -n 1 -s -r -p $'\nPress any key to return to the main menu...'
+        continue
       fi
 
       # Block version sanity check
@@ -1498,7 +1455,6 @@ EOF
         latest_ref_block="$filebin_block_numeric"
       fi
       latest_ref_block_int=$(echo "$latest_ref_block" | grep -oE '[0-9]+' | head -n 1)
-      # Numeric compare blocks
       if [[ -n "$filebin_block_numeric" && -n "$latest_ref_block_int" && "$filebin_block_numeric" =~ ^[0-9]+$ && "$latest_ref_block_int" =~ ^[0-9]+$ ]]; then
         if ((filebin_block_numeric < latest_ref_block_int)); then
           echo -e ""
