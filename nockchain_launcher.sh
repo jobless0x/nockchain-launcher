@@ -64,10 +64,32 @@ pad_plain() {
 # Block normalization helper
 normalize_block() {
   local block="$1"
-  if [[ "$block" =~ ^[0-9]{1,3}(\.[0-9]{3})*$ ]]; then
-    echo "$block" | tr -d '.'
+  # Remove all dots
+  local undotted="${block//./}"
+  # Only output if numeric (ignore hashes/base58)
+  if [[ "$undotted" =~ ^[0-9]+$ ]]; then
+    # Remove leading zeros
+    echo "$((10#$undotted))"
   else
     echo ""
+  fi
+}
+
+# Format a numeric block number as dotted, e.g. 14419 -> 14.419
+format_block_dotted() {
+  local num="$1"
+  # Only works if input is numeric
+  if [[ "$num" =~ ^[0-9]+$ ]]; then
+    local len=${#num}
+    if ((len > 3)); then
+      local main_part=${num:0:len-3}
+      local tail_part=${num:len-3:3}
+      echo "${main_part}.${tail_part}"
+    else
+      echo "$num"
+    fi
+  else
+    echo "$num"
   fi
 }
 
@@ -143,15 +165,43 @@ safe_kill_screen() {
   fi
 }
 
-# Extract latest validated block from a miner log
+# Extract latest validated block from a miner log (supports dotted, undotted, base58)
 extract_latest_block() {
   local log_file="$1"
   if [[ -f "$log_file" && -r "$log_file" ]]; then
-    grep -a 'added to validated blocks at' "$log_file" 2>/dev/null |
-      tail -n 1 | grep -oP 'at\s+\K([0-9]{1,3}(?:\.[0-9]{3})*)' || echo "--"
+    # Get the last relevant log line
+    local line
+    line=$(grep -a 'added to validated blocks at' "$log_file" | tail -n 1 || true)
+    # Extract the block number after 'at '
+    blk=$(echo "$line" | awk -F 'at ' '{print $2}' | awk '{print $1}')
+    if [[ -n "$blk" ]]; then
+      echo "$blk"
+      return
+    fi
+    echo "--"
   else
     echo "--"
   fi
+}
+
+extract_block_num_from_line() {
+  local line="$1"
+  # Try: "at <dotted/undotted number>"
+  if [[ "$line" =~ at[[:space:]]([0-9]{1,3}(?:\.[0-9]{3})*) ]]; then
+    echo "${BASH_REMATCH[1]}"
+    return
+  fi
+  # Try: "block <dotted/undotted number>"
+  if [[ "$line" =~ block[[:space:]]([0-9]{1,3}(?:\.[0-9]{3})*) ]]; then
+    echo "${BASH_REMATCH[1]}"
+    return
+  fi
+  # Try: "block <base58 string>"
+  if [[ "$line" =~ block[[:space:]]([a-zA-Z0-9]+) ]]; then
+    echo "${BASH_REMATCH[1]}"
+    return
+  fi
+  echo ""
 }
 
 # FZF menu entry formatter
@@ -251,116 +301,113 @@ restart_miner_session() {
 }
 
 update_proof_durations() {
-  local miner=$1
+  local miner="$1"
   local log_file="$NOCKCHAIN_HOME/$miner/$miner.log"
   local proof_csv="$NOCKCHAIN_HOME/$miner/${miner}_proof_log.csv"
+  local last_csv_line=""
+
+  # Ensure miner directory exists
+  [[ -d "$NOCKCHAIN_HOME/$miner" ]] || mkdir -p "$NOCKCHAIN_HOME/$miner"
+
+  # If log file doesn't exist, return dashes
+  [[ -f "$log_file" ]] || {
+    echo "--|--|--"
+    return
+  }
 
   # Ensure CSV exists and has header
   if [[ ! -f "$proof_csv" ]]; then
-    echo "start_time,finish_time,block,comp_time" >"$proof_csv"
+    echo "thread,start_time,finish_time,duration_s" >"$proof_csv"
     sync "$proof_csv"
-    avg_comp=$(tail -n +2 "$proof_csv" | awk -F, '{print $2","$4}' | sort | tail -n 50 | awk -F, '{sum+=$2; count++} END {if(count>0) printf("%.1f", sum/count); else print "--"}')
   fi
 
-  # Bootstrap: scan all finished-proof lines, clean ANSI codes, and filter for lines with block/timestamp
-  mapfile -t fp_lines < <(
-    sed 's/\x1B\[[0-9;]*m//g' "$log_file" | grep -a 'finished-proof'
-  )
+  # Determine last processed finish_time and thread from CSV (for incremental parsing)
+  last_csv_line=$(tail -n 1 "$proof_csv" 2>/dev/null)
+  last_finish_time=$(echo "$last_csv_line" | awk -F, '{print $3}')
+  last_thread=$(echo "$last_csv_line" | awk -F, '{print $1}')
 
-  # Determine if we should skip the bulk loop (if CSV exists and last entry is newer than 1 hour)
-  skip_bulk=0
-  if [[ -f "$proof_csv" ]]; then
-    last_ts=$(tail -n 1 "$proof_csv" | awk -F, '{print $2}')
-    if [[ -n "$last_ts" ]]; then
-      last_ts_epoch=$(date -d "$last_ts" +%s 2>/dev/null || echo 0)
-      now_epoch=$(date +%s)
-      if ((now_epoch - last_ts_epoch < 3600)); then
-        skip_bulk=1
-      fi
-    fi
-  fi
+  # Holds the latest "starting mining attempt" time per thread
+  declare -A thread_last_start_time
 
-  if [[ "$skip_bulk" -eq 0 ]]; then
-    valid_count=0
-    total_checked=0
-    for ((idx = ${#fp_lines[@]} - 1; idx >= 0 && valid_count < 50; idx--)); do
-      fp_line="${fp_lines[idx]}"
-      block=$(echo "$fp_line" | tr -d '\000' | sed 's/\x1B\[[0-9;]*m//g' | grep -oP 'block\s+\K[0-9]+\.[0-9]+' | tr -d '\000' | head -n 1)
-      finish_time=$(echo "$fp_line" | tr -d '\000' | grep -oP '\(\K[0-9]{2}:[0-9]{2}:[0-9]{2}')
-      if [[ -z "$block" || -z "$finish_time" ]]; then
-        ((total_checked++))
-        continue
-      fi
-      # Find mining-on line for this block
-      mline=$(strings "$log_file" | grep "mining-on" | grep "$block" | tail -n 1)
-      if [[ -z "$mline" ]]; then
-        block_hex=$(echo -n "$block" | xxd -p)
-        xxd -p "$log_file" | tr -d '\n' >/tmp/${miner}.hex
-        offset=$(grep -ob "$block_hex" /tmp/${miner}.hex | cut -d: -f1 | head -n 1)
-        if [[ -n "$offset" ]]; then
-          start=$((offset - 2000))
-          [[ "$start" -lt 0 ]] && start=0
-          dd if=/tmp/${miner}.hex bs=1 skip=$start count=3000 2>/dev/null | xxd -r -p >/tmp/${miner}_pre.log
-          mline=$(tr -d '\000' </tmp/${miner}_pre.log | grep -a 'mining-on' | tail -n 1)
+  # For very large logs, avoid O(n²) grep: process in one loop
+  mapfile -t log_lines < <(sed 's/\x1B\[[0-9;]*[a-zA-Z]//g' "$log_file" | tail -n 5000)
+
+  for ((i = 0; i < ${#log_lines[@]}; ++i)); do
+    line="${log_lines[i]}"
+    # Early skip: ignore lines up to and including last processed finish_time/thread
+    if [[ "$line" =~ didn\'t\ find\ block,\ starting\ new\ attempt.\ thread=([0-9]+) ]]; then
+      this_thread="${BASH_REMATCH[1]}"
+      if [[ "$line" =~ \(([0-9]{2}:[0-9]{2}:[0-9]{2})\) ]]; then
+        this_finish="${BASH_REMATCH[1]}"
+        if [[ "$this_thread" == "$last_thread" && "$this_finish" == "$last_finish_time" ]]; then
+          found_last=1
         fi
       fi
-      start_time=$(echo "$mline" | sed 's/\x1B\[[0-9;]*m//g' | grep -a -oP '\(\K[0-9]{2}:[0-9]{2}:[0-9]{2}')
-      if [[ -z "$start_time" ]]; then
-        ((total_checked++))
-        continue
-      fi
-      comp=$(($(date -d "$finish_time" +%s) - $(date -d "$start_time" +%s)))
-      # Check for duplicate: block and finish_time
-      if grep -Fq ",$finish_time,$block," <(tail -n +2 "$proof_csv"); then
-        :
-      else
-        echo "$start_time,$finish_time,$block,$comp" >>"$proof_csv"
-        sync "$proof_csv"
-      fi
-      ((total_checked++))
-      if [[ -n "$block" && -n "$start_time" && -n "$finish_time" ]]; then
-        ((valid_count++))
-      fi
-    done
-  fi
+      continue
+    fi
 
-  # Process latest finished-proof line (repeat logic for most recent entry)
-  last_comp="--"
-  fp_line=$(sed 's/\x1B\[[0-9;]*m//g' "$log_file" | grep -a 'finished-proof' | tail -n 1)
-  block=$(echo "$fp_line" | tr -d '\000' | sed 's/\x1B\[[0-9;]*m//g' | grep -oE '[0-9]+(\.[0-9]+){4,}' | tr -d '\000' | head -n 1)
-  finish_time=$(echo "$fp_line" | tr -d '\000' | grep -oP '\(\K[0-9]{2}:[0-9]{2}:[0-9]{2}')
-  if [[ -n "$block" && -n "$finish_time" ]]; then
-    mline=$(strings "$log_file" | grep "mining-on" | grep "$block" | tail -n 1 | tr -d '\000')
-    if [[ -z "$mline" ]]; then
-      block_hex=$(echo -n "$block" | xxd -p)
-      xxd -p "$log_file" | tr -d '\n' >/tmp/${miner}.hex
-      offset=$(grep -ob "$block_hex" /tmp/${miner}.hex | cut -d: -f1 | head -n 1 | tr -d '\000')
-      if [[ -n "$offset" ]]; then
-        start=$((offset - 2000))
-        [[ "$start" -lt 0 ]] && start=0
-        dd if=/tmp/${miner}.hex bs=1 skip=$start count=3000 2>/dev/null | xxd -r -p >/tmp/${miner}_pre.log
-        mline=$(grep -a 'mining-on' /tmp/${miner}_pre.log | tail -n 1 | tr -d '\000')
+    # After we've found last, only parse new
+    if [[ "$line" =~ starting\ mining\ attempt\ on\ thread\ ([0-9]+) ]]; then
+      thread="${BASH_REMATCH[1]}"
+      if [[ "$line" =~ \(([0-9]{2}:[0-9]{2}:[0-9]{2})\) ]]; then
+        thread_last_start_time["$thread"]="${BASH_REMATCH[1]}"
+      fi
+      continue
+    fi
+
+    if [[ "$line" =~ didn\'t\ find\ block,\ starting\ new\ attempt.\ thread=([0-9]+) ]]; then
+      thread="${BASH_REMATCH[1]}"
+      if [[ "$line" =~ \(([0-9]{2}:[0-9]{2}:[0-9]{2})\) ]]; then
+        finish_time="${BASH_REMATCH[1]}"
+        start_time="${thread_last_start_time[$thread]:-}"
+        if [[ -n "$start_time" ]]; then
+          start_epoch=$(date -d "$start_time" +%s 2>/dev/null)
+          finish_epoch=$(date -d "$finish_time" +%s 2>/dev/null)
+          if [[ -n "$start_epoch" && -n "$finish_epoch" && "$finish_epoch" -ge "$start_epoch" ]]; then
+            duration=$((finish_epoch - start_epoch))
+            if ! grep -q "^$thread,$start_time,$finish_time,$duration\$" "$proof_csv"; then
+              echo "$thread,$start_time,$finish_time,$duration" >>"$proof_csv"
+              sync "$proof_csv"
+            fi
+          fi
+        fi
+      fi
+      continue
+    fi
+  done
+
+  # Summarize for dashboard: exclude header
+  last_duration="--"
+  avg_duration="--"
+  proofs_per_sec="--"
+
+  nrows=$(wc -l <"$proof_csv" 2>/dev/null)
+  if ((nrows > 1)); then
+    # Last duration
+    last_duration=$(tail -n 1 "$proof_csv" | awk -F, '{print $4}')
+
+    # Average duration
+    mapfile -t durations < <(tail -n 50 "$proof_csv" | awk -F, '{print $4}' | grep -E '^[0-9]+$')
+    if [[ ${#durations[@]} -gt 0 ]]; then
+      sum=0
+      for d in "${durations[@]}"; do sum=$((sum + d)); done
+      avg_duration=$(awk -v s="$sum" -v n="${#durations[@]}" 'BEGIN{printf "%.2f", s/n}')
+    fi
+
+    # Proofs/s over last 50 entries, using all start_times (regardless of thread)
+    mapfile -t start_times < <(tail -n 50 "$proof_csv" | awk -F, '{print $2}' | grep -E '^[0-9]{2}:[0-9]{2}:[0-9]{2}$')
+    count=${#start_times[@]}
+    if ((count > 1)); then
+      first_sec=$(date -d "${start_times[0]}" +%s 2>/dev/null)
+      last_sec=$(date -d "${start_times[-1]}" +%s 2>/dev/null)
+      duration_s=$((last_sec - first_sec))
+      if ((duration_s > 0)); then
+        proofs_per_sec=$(awk -v t="$count" -v d="$duration_s" 'BEGIN{printf "%.4f", t/d}')
       fi
     fi
-    start_time=$(echo "$mline" | sed 's/\x1B\[[0-9;]*m//g' | grep -a -oP '\(\K[0-9]{2}:[0-9]{2}:[0-9]{2}')
-    if [[ -n "$start_time" ]]; then
-      comp=$(($(date -d "$finish_time" +%s) - $(date -d "$start_time" +%s)))
-      # Check for duplicate before appending
-      if ! grep -Fq ",$finish_time,$block," <(tail -n +2 "$proof_csv"); then
-        echo "$start_time,$finish_time,$block,$comp" >>"$proof_csv"
-        sync "$proof_csv"
-      fi
-      last_comp="$comp"
-    fi
   fi
 
-  # Calculate average comp_time of last 50 entries sorted by finish_time
-  avg_comp="--"
-  if [[ -f "$proof_csv" ]]; then
-    avg_comp=$(tail -n +2 "$proof_csv" | awk -F, '{print $2","$4}' | sort | tail -n 50 | awk -F, '{sum+=$2; count++} END {if(count>0) printf("%.1f", sum/count); else print "--"}')
-  fi
-
-  echo "${last_comp}|${avg_comp}"
+  echo "${last_duration}|${avg_duration}|${proofs_per_sec}"
 }
 
 get_block_deltas() {
@@ -403,7 +450,7 @@ get_block_deltas() {
       # Extract timestamp in (HH:MM:SS)
       local ts=$(echo "$line" | grep -oP '\(\K[0-9]{2}:[0-9]{2}:[0-9]{2}')
       local blk
-      blk=$(echo "$line" | grep -oP 'at\s+\K([0-9]{1,3}(?:\.[0-9]{3})*)')
+      blk=$(extract_latest_block "$log_file")
       if [[ -z "$ts" || -z "$blk" ]]; then
         continue
       fi
@@ -433,7 +480,7 @@ get_block_deltas() {
   latest_log_line=$(sed 's/\x1B\[[0-9;]*m//g' "$log_file" | grep -a 'added to validated blocks at' | tail -n 1)
   if [[ -n "$latest_log_line" ]]; then
     latest_ts=$(echo "$latest_log_line" | grep -oP '\(\K[0-9]{2}:[0-9]{2}:[0-9]{2}')
-    latest_blk=$(echo "$latest_log_line" | grep -oP 'at\s+\K([0-9]{1,3}(?:\.[0-9]{3})*)')
+    latest_blk=$(extract_latest_block "$log_file")
     if [[ -n "$latest_ts" && -n "$latest_blk" ]]; then
       today=$(date +%Y-%m-%d)
       if [[ "$latest_ts" =~ ^[0-9]{2}:[0-9]{2}:[0-9]{2}$ ]]; then
@@ -463,14 +510,15 @@ get_block_deltas() {
     return
   fi
 
-  # Find the entry with the highest block number (ignoring order) and use its timestamp
+  # Always use normalized numeric block for comparisons.
   local max_blk_numeric=0
   local ts_for_max_blk=""
   for entry in "${csv_entries[@]}"; do
     ts=$(echo "$entry" | cut -d, -f1)
     blk=$(echo "$entry" | cut -d, -f2)
-    blk_numeric=$(echo "$blk" | tr -d '.' | sed 's/^0*//')
-    if [[ "$blk_numeric" =~ ^[0-9]+$ ]] && ((blk_numeric > max_blk_numeric)); then
+    # Always use normalized numeric block for comparisons.
+    blk_numeric=$(normalize_block "$blk")
+    if [[ -n "$blk_numeric" && "$blk_numeric" -gt "$max_blk_numeric" ]]; then
       max_blk_numeric=$blk_numeric
       ts_for_max_blk="$ts"
     fi
@@ -512,18 +560,36 @@ get_block_deltas() {
 get_latest_statejam_block() {
   local block="--"
   local mins="--"
-  # Grab latest block from backup log and journalctl, pick the highest
+  # Grab latest block from backup log and journalctl, pick the highest (as dotted!)
   block=$(
     {
-      cat "$NOCKCHAIN_HOME/statejam_backup.log" 2>/dev/null
-      journalctl -u nockchain-statejam-backup.service --no-pager -o cat 2>/dev/null
+      tail -n 30 "$NOCKCHAIN_HOME/statejam_backup.log" 2>/dev/null
+      journalctl -u nockchain-statejam-backup.service --no-pager -o cat -n 30 2>/dev/null
     } |
       grep -a 'Exported state.jam from block' |
       sed -r 's/\x1B\[[0-9;]*[a-zA-Z]//g' |
-      grep -oP 'block\s+\K([0-9]{1,3}(?:\.[0-9]{3})*)' |
-      sort -V | tail -n 1
+      # Extract *all* numeric groups (dotted/undotted) per line, join, pick the highest
+      while read -r line; do
+        # Try to find a block like "14.444" or "14444" in the line
+        block_raw=$(echo "$line" | grep -oE '[0-9]{1,3}(\.[0-9]{3})+' | tail -n1)
+        if [[ -z "$block_raw" ]]; then
+          # Fallback to any number (undotted, but not short group)
+          block_raw=$(echo "$line" | grep -oE '[0-9]{4,}' | tail -n1)
+        fi
+        if [[ -n "$block_raw" ]]; then
+          # Normalize to numeric (undotted, e.g. 14.444 -> 14444)
+          block_num="${block_raw//./}"
+          echo "$block_num"
+        fi
+      done |
+      sort -n | tail -n 1
   )
-  [[ -z "$block" ]] && block="--"
+  # Display as dotted for output
+  if [[ -n "$block" && "$block" =~ ^[0-9]+$ ]]; then
+    block=$(format_block_dotted "$block")
+  else
+    block="--"
+  fi
   # Calculate next save
   if pgrep -f export_latest_state_jam.sh >/dev/null 2>&1; then
     mins="running"
@@ -565,103 +631,29 @@ get_network_height() {
 
     if [[ -f "$log_file" && -r "$log_file" ]]; then
       heard_block=$(grep -a 'heard block' "$log_file" | tail -n 5 | grep -oP 'height\s+\K([0-9]{1,3}(?:\.[0-9]{3})*)' || true)
-      validated_block=$(grep -a 'added to validated blocks at' "$log_file" | tail -n 5 | grep -oP 'at\s+\K([0-9]{1,3}(?:\.[0-9]{3})*)' || true)
+      validated_block=$(extract_latest_block "$log_file")
       combined=$(printf "%s\n%s\n" "$heard_block" "$validated_block" | sort -V | tail -n 1)
       [[ -n "$combined" ]] && all_blocks+=("$combined")
     fi
   done
+  # Always use normalized numeric block for comparisons.
   if [[ ${#all_blocks[@]} -gt 0 ]]; then
-    NETWORK_HEIGHT=$(printf "%s\n" "${all_blocks[@]}" | sort -V | tail -n 1)
+    NETWORK_HEIGHT="--"
+    # Find max numeric block among all_blocks
+    max_numeric=0
+    for blk in "${all_blocks[@]}"; do
+      num=$(normalize_block "$blk")
+      if [[ -n "$num" && "$num" -gt "$max_numeric" ]]; then
+        max_numeric="$num"
+        NETWORK_HEIGHT="$blk"
+      fi
+    done
+    # If nothing numeric, fallback to original string max (still sorted -V)
+    if [[ "$NETWORK_HEIGHT" == "--" ]]; then
+      NETWORK_HEIGHT=$(printf "%s\n" "${all_blocks[@]}" | sort -V | tail -n 1)
+    fi
   fi
   echo "$NETWORK_HEIGHT"
-}
-
-get_avg_proof_time_and_proofs_per_sec() {
-  local miner="$1"
-  local attempts_csv="$NOCKCHAIN_HOME/$miner/${miner}_attempt_log.csv"
-  local total avg_proof_time proofs_per_sec
-
-  if [[ ! -f "$attempts_csv" ]]; then
-    echo "-- --"
-    return
-  fi
-
-  # Read last 50 timestamps (skip header, extract second field, skip empty)
-  mapfile -t attempts < <(awk -F, 'NR>1 && $2 ~ /^[0-9]{2}:[0-9]{2}:[0-9]{2}$/ {print $2}' "$attempts_csv" | tail -n 50)
-  total=${#attempts[@]}
-  if ((total < 2)); then
-    echo "-- --"
-    return
-  fi
-
-  local prev="" sum=0 count=0
-  for ts in "${attempts[@]}"; do
-    curr=$(date -d "$ts" +%s 2>/dev/null)
-    if [[ -n "$prev" && -n "$curr" ]]; then
-      diff=$((curr - prev))
-      if ((diff > 0)); then
-        sum=$((sum + diff))
-        count=$((count + 1))
-      fi
-    fi
-    prev="$curr"
-  done
-  if ((count > 0)); then
-    avg_proof_time=$(awk -v s="$sum" -v c="$count" 'BEGIN { printf "%.2f", s/c }')
-  else
-    avg_proof_time="--"
-  fi
-
-  # Proofs/sec: total span from first to last
-  first_sec=$(date -d "${attempts[0]}" +%s 2>/dev/null)
-  last_sec=$(date -d "${attempts[-1]}" +%s 2>/dev/null)
-  duration=$((last_sec - first_sec))
-  if ((duration > 0)); then
-    proofs_per_sec=$(awk -v t="$total" -v d="$duration" 'BEGIN { printf "%.4f", t/d }')
-  else
-    proofs_per_sec="--"
-  fi
-  echo "$avg_proof_time $proofs_per_sec"
-}
-
-update_proof_attempts_log() {
-  local miner="$1"
-  local LOG_FILE="$NOCKCHAIN_HOME/$miner/$miner.log"
-  local attempts_csv="$NOCKCHAIN_HOME/$miner/${miner}_attempt_log.csv"
-
-  # Ensure CSV exists with header
-  if [[ ! -f "$attempts_csv" ]]; then
-    echo "line_number,timestamp,log_line" >"$attempts_csv"
-  fi
-
-  # Get last recorded log line number
-  local last_csv_line=0
-  if [[ -s "$attempts_csv" ]]; then
-    last_csv_line=$(tail -n 1 "$attempts_csv" | cut -d',' -f1)
-    last_csv_line=${last_csv_line:-0}
-  fi
-
-  # Use sed to remove ANSI codes, then grep for "starting proving attempt", skipping sync/inactive, and append new entries
-  sed 's/\x1B\[[0-9;]*m//g' "$LOG_FILE" |
-    awk -v last_line="$last_csv_line" '
-      /starting proving attempt/ && !/sync/i && !/inactive/i { line[++n] = $0 }
-      END {
-        for (i = 1; i <= n; i++) {
-          # Calculate actual line number as last_csv_line + i
-          match(line[i], /\(([0-9]{2}:[0-9]{2}:[0-9]{2})\)/, arr);
-          if (length(arr[1])) print (last_line + i) "," arr[1] "," line[i];
-        }
-      }
-    ' >>"$attempts_csv"
-
-  # If CSV exceeds 51 lines (header + 50 data), trim to last 50
-  local n_lines
-  n_lines=$(wc -l <"$attempts_csv")
-  if ((n_lines > 51)); then
-    head -n 1 "$attempts_csv" >"$attempts_csv.tmp"
-    tail -n 50 "$attempts_csv" >>"$attempts_csv.tmp"
-    mv "$attempts_csv.tmp" "$attempts_csv"
-  fi
 }
 
 #
@@ -804,9 +796,10 @@ EOF
 
   # Extract network height from all miner logs (for dashboard)
   NETWORK_HEIGHT=$(get_network_height)
+  network_height_disp=$(format_block_dotted "$(normalize_block "$NETWORK_HEIGHT")")
 
   # Display height
-  printf "  ${CYAN}%-12s${RESET}%-20s\n" "Height:" "$NETWORK_HEIGHT"
+  printf "  ${CYAN}%-12s${RESET}%-20s\n" "Height:" "$network_height_disp"
 
   # Display red line
   echo -e "\e[31m::════════════════════════════════════════════════════════\e[0m"
@@ -1140,7 +1133,9 @@ except Exception as e:
       else
         status_icon="🔴"
       fi
-      label="$(styled_menu_entry "$status_icon" "$miner_name" "$latest_block")"
+      latest_block_num="$(normalize_block "$latest_block")"
+      latest_block_dot="$(format_block_dotted "$latest_block_num")"
+      label="$(styled_menu_entry "$status_icon" "$miner_name" "$latest_block_dot")"
       menu_entries+=("$label")
       miner_dirs_map["$miner_name"]="$dir"
       miner_blocks_map["$miner_name"]="$latest_block"
@@ -1257,8 +1252,10 @@ EOF
         [[ -z "$miner_name" ]] && continue
         log="$d/$miner_name.log"
         if [[ -f "$log" ]]; then
-          raw_line=$(grep -a 'added to validated blocks at' "$log" 2>/dev/null | tail -n 1 || true)
-          blk=$(echo "$raw_line" | grep -oP 'at\s+\K([0-9]{1,3}(?:\.[0-9]{3})*)' || true)
+          blk="--"
+          if [[ -n "$log" ]]; then
+            blk=$(extract_latest_block "$log")
+          fi
           num=$(echo "$blk" | tr -d '.')
           if [[ "$num" =~ ^[0-9]+$ ]] && ((num > highest_miner_block)); then
             highest_miner_block=$num
@@ -1268,11 +1265,11 @@ EOF
         fi
       done
 
-      # Normalize all blocks for comparison
-      gd_num=$(echo "$GD_BLOCK" | tr -d '.')
-      github_num=$(echo "$GITHUB_BLOCK" | tr -d '.')
-      filebin_num=$(echo "$FILEBIN_BLOCK" | tr -d '.')
-      miner_num=$(echo "$MINER_BLOCK" | tr -d '.')
+      # Always use normalized numeric block for comparisons.
+      gd_num=$(normalize_block "$GD_BLOCK")
+      github_num=$(normalize_block "$GITHUB_BLOCK")
+      filebin_num=$(normalize_block "$FILEBIN_BLOCK")
+      miner_num=$(normalize_block "$MINER_BLOCK")
 
       [[ ! "$gd_num" =~ ^[0-9]+$ ]] && gd_num=0
       [[ ! "$github_num" =~ ^[0-9]+$ ]] && github_num=0
@@ -1301,16 +1298,26 @@ EOF
 
       echo -e ""
       echo -e "${CYAN}Summary of latest blocks:${RESET}"
-      echo -e "  Google Drive:  ${YELLOW}$GD_BLOCK${RESET}"
-      echo -e "  GitHub:        ${YELLOW}$GITHUB_BLOCK${RESET}"
-      echo -e "  Filebin:       ${YELLOW}$FILEBIN_BLOCK${RESET}"
-      echo -e "  Local Miner:   ${YELLOW}$MINER_BLOCK${RESET}"
+      echo -e "  Google Drive:  ${YELLOW}$(format_block_dotted "$GD_BLOCK")${RESET}"
+      echo -e "  GitHub:        ${YELLOW}$(format_block_dotted "$GITHUB_BLOCK")${RESET}"
+      echo -e "  Filebin:       ${YELLOW}$(format_block_dotted "$FILEBIN_BLOCK")${RESET}"
+      echo -e "  Local Miner:   ${YELLOW}$(format_block_dotted "$MINER_BLOCK")${RESET} (${CYAN}$(basename "$MINER_LATEST_DIR")${RESET})"
       echo -e ""
-      echo -e "${BOLD_BLUE}Most recent block is ${YELLOW}$max_num${BOLD_BLUE} from ${GREEN}$max_src${RESET}."
+      if [[ "$src_tag" == "miner" ]]; then
+        miner_name="$(basename "$MINER_LATEST_DIR")"
+        echo -e "${BOLD_BLUE}Most recent block is ${YELLOW}$(format_block_dotted "$max_num")${BOLD_BLUE} from ${GREEN}Local Miner (${CYAN}${miner_name}${GREEN})${RESET}."
+      else
+        echo -e "${BOLD_BLUE}Most recent block is ${YELLOW}$(format_block_dotted "$max_num")${BOLD_BLUE} from ${GREEN}$max_src${RESET}."
+      fi
       echo -e ""
 
       # Ask for confirmation
-      confirm_yes_no "Proceed to fetch state.jam from $max_src (block $max_num)?" || {
+      if [[ "$src_tag" == "miner" ]]; then
+        miner_name="$(basename "$MINER_LATEST_DIR")"
+        confirm_yes_no "Proceed to fetch state.jam from Local Miner (${miner_name} block $(format_block_dotted "$max_num"))?"
+      else
+        confirm_yes_no "Proceed to fetch state.jam from $max_src (block $(format_block_dotted "$max_num"))?"
+      fi || {
         echo -e "${CYAN}Returning to menu...${RESET}"
         continue
       }
@@ -1759,42 +1766,103 @@ EOF
 source "$HOME/.nockchain_launcher.conf"
 set -euo pipefail
 
+# Extract latest validated block from a miner log (supports dotted, undotted, base58)
+extract_latest_block() {
+  local log_file="$1"
+  if [[ -f "$log_file" && -r "$log_file" ]]; then
+    # Get the last relevant log line
+    local line
+    line=$(tail -n 500 "$log_file" 2>/dev/null | grep -a 'added to validated blocks at' | tail -n 1 || true)
+    # Extract the block number after 'at '
+    blk=$(echo "$line" | awk -F 'at ' '{print $2}' | awk '{print $1}')
+    if [[ -n "$blk" ]]; then
+      echo "$blk"
+      return
+    fi
+    echo "--"
+  else
+    echo "--"
+  fi
+}
+
+extract_block_num_from_line() {
+  local line="$1"
+  # Try: "at <dotted/undotted number>"
+  if [[ "$line" =~ at[[:space:]]([0-9]{1,3}(?:\.[0-9]{3})*) ]]; then
+    echo "${BASH_REMATCH[1]}"
+    return
+  fi
+  # Try: "block <dotted/undotted number>"
+  if [[ "$line" =~ block[[:space:]]([0-9]{1,3}(?:\.[0-9]{3})*) ]]; then
+    echo "${BASH_REMATCH[1]}"
+    return
+  fi
+  # Try: "block <base58 string>"
+  if [[ "$line" =~ block[[:space:]]([a-zA-Z0-9]+) ]]; then
+    echo "${BASH_REMATCH[1]}"
+    return
+  fi
+  echo ""
+}
+
+# Block normalization helper
 normalize_block() {
   local block="$1"
-  if [[ "$block" =~ ^[0-9]{1,3}(\.[0-9]{3})*$ ]]; then
-    echo "$block" | tr -d '.'
+  # Remove all dots
+  local undotted="${block//./}"
+  # Only output if numeric (ignore hashes/base58)
+  if [[ "$undotted" =~ ^[0-9]+$ ]]; then
+    # Remove leading zeros
+    echo "$((10#$undotted))"
   else
     echo ""
+  fi
+}
+
+# Format a numeric block number as dotted, e.g. 14419 -> 14.419
+format_block_dotted() {
+  local num="$1"
+  # Only works if input is numeric
+  if [[ "$num" =~ ^[0-9]+$ ]]; then
+    local len=${#num}
+    if ((len > 3)); then
+      local main_part=${num:0:len-3}
+      local tail_part=${num:len-3:3}
+      echo "${main_part}.${tail_part}"
+    else
+      echo "$num"
+    fi
+  else
+    echo "$num"
   fi
 }
 
 SRC=""
 HIGHEST=0
 HIGHEST_BLOCK=""
-
 for d in "$NOCKCHAIN_HOME"/miner[0-9]*; do
   [[ -d "$d" ]] || continue
   miner_name=$(basename "$d" | sed -nE 's/^(miner[0-9]+)$/\1/p')
   [[ -z "$miner_name" ]] && continue
   log="$d/$miner_name.log"
-  if [[ -f "$log" ]]; then
-    raw_line=$(grep -a 'added to validated blocks at' "$log" 2>/dev/null | tail -n 1 || true)
-    blk=$(echo "$raw_line" | grep -oP 'at\s+\K([0-9]{1,3}(?:\.[0-9]{3})*)' || true)
-    # --- BEGIN logging block per miner ---
-    if [[ -n "$blk" ]]; then
-      echo -e "🟢 Detected $(basename "$d") at block $blk"
-    else
-      echo -e "⚠️ No valid block found in $(basename "$d")"
+  blk="--"
+  if [[ -f "$log" && -r "$log" ]]; then
+    blk=$(extract_latest_block "$log")
+  fi
+
+  blk_num="$(normalize_block "$blk")"
+  blk_dot="$(format_block_dotted "$blk_num")"
+  # Pad miner name to 8 chars
+  if [[ -n "$blk_num" && "$blk_num" != "--" ]]; then
+    printf "🟢 %-8s detected at block %s\n" "$miner_name" "$blk_dot"
+    # ** THIS IS THE KEY: Compare and update highest **
+    if [[ "$blk_num" =~ ^[0-9]+$ ]] && (( blk_num > HIGHEST )); then
+      SRC="$d"
+      HIGHEST="$blk_num"
+      HIGHEST_BLOCK="$blk_dot"
     fi
-    # --- END logging block per miner ---
-    if [[ -n "$blk" ]]; then
-      num=$(normalize_block "$blk")
-      if (( num > HIGHEST )); then
-        HIGHEST=$num
-        HIGHEST_BLOCK=$blk
-        SRC="$d"
-      fi
-    fi
+  else
+    printf "⚠️ %-8s No valid block found\n" "$miner_name"
   fi
 done
 
@@ -1988,6 +2056,8 @@ EOS
 
       # Extract network height from all miner logs (live, every refresh, OPTIMIZED)
       NETWORK_HEIGHT=$(get_network_height)
+      NETWORK_HEIGHT_NUM=$(normalize_block "$NETWORK_HEIGHT")
+      NETWORK_HEIGHT_DOT=$(format_block_dotted "$NETWORK_HEIGHT_NUM")
 
       # State.jam status line
       output=$(get_latest_statejam_block | tr '|' ' ' 2>/dev/null || echo "-- --")
@@ -2008,7 +2078,7 @@ EOS
 
       # Print Network height and state.jam status
       echo ""
-      echo -e "${CYAN}📡 Network height: ${YELLOW}$NETWORK_HEIGHT${RESET}  |  $STATEJAM_STATUS"
+      echo -e "${CYAN}📡 Network height: ${YELLOW}$NETWORK_HEIGHT_DOT${RESET}  |  $STATEJAM_STATUS"
 
       # Display total CPU and MEM usage
       TOTAL_CPU=$(get_total_cpu_usage)
@@ -2019,8 +2089,8 @@ EOS
       printf "${CYAN}🧮 Total CPU Usage:${RESET} ${YELLOW}%-6s%%${RESET} | ${CYAN}Total Mem:${RESET} ${YELLOW}%s%%${RESET} (${YELLOW}%s${RESET}/${YELLOW}%s${RESET} GB)\n" \
         "$TOTAL_CPU" "$TOTAL_MEM_PCT" "$TOTAL_MEM_USED" "$TOTAL_MEM_TOTAL"
       echo ""
-      printf "   | %-9s | %-9s | %-9s | %-9s | %-9s | %-9s | %-5s | %-9s | %-6s | %-9s | %-9s | %-13s | %-13s | %-9s | %-9s\n" \
-        "Miner" "Uptime" "CPU" "MEM" "RAM (GB)" "Block" "Lag" "Status" "Peers" "LastProof" "AvgProof" "AvgAttempt" "Attempts/s" "BlkAge" "AvgBlk"
+      printf "   | %-9s | %-9s | %-6s | %-6s | %-9s | %-9s | %-5s | %-9s | %-6s | %-9s | %-9s | %-9s | %-9s | %-9s\n" \
+        "Miner" "Uptime" "CPU" "MEM" "RAM (GB)" "Block" "Lag" "Status" "Peers" "LastProof" "AvgProof" "Proofs/s" "BlkAge" "AvgBlk"
 
       all_miners=()
       for miner_dir in "$NOCKCHAIN_HOME"/miner[0-9]*; do
@@ -2147,7 +2217,20 @@ EOS
           fi
 
           if [[ -f "$log_file" ]]; then
-            latest_block=$(grep -a 'added to validated blocks at' "$log_file" 2>/dev/null | tail -n 1 | grep -oP 'at\s+\K([0-9]{1,3}(?:\.[0-9]{3})*)' || echo "--")
+            # Extract last validated block (dotted, undotted, or hash)
+            blk="--"
+            if [[ -f "$log_file" && -r "$log_file" ]]; then
+              blk=$(extract_latest_block "$log_file")
+              # echo "[DEBUG] extract_latest_block for $session at $(date +'%Y-%m-%d %H:%M:%S.%3N')" >>/tmp/launcher_monitor_timing.log
+            fi
+            blk_num="$(normalize_block "$blk")"
+            # echo "[DEBUG] normalize_block for $session at $(date +'%Y-%m-%d %H:%M:%S.%3N')" >>/tmp/launcher_monitor_timing.log
+            if [[ -n "$blk_num" && "$blk_num" != "" ]]; then
+              latest_block="$(format_block_dotted "$blk_num")"
+              # echo "[DEBUG] format_block_dotted for $session at $(date +'%Y-%m-%d %H:%M:%S.%3N')" >>/tmp/launcher_monitor_timing.log
+            else
+              latest_block="--"
+            fi
           else
             latest_block="--"
           fi
@@ -2161,33 +2244,36 @@ EOS
 
           lag="--"
           lag_int=0
-          if [[ "$NETWORK_HEIGHT" =~ ^[0-9]+(\.[0-9]+)?$ && "$latest_block" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
-            lag_val=$(awk "BEGIN { print $NETWORK_HEIGHT - $latest_block }")
-            lag_int=$(printf "%.0f" "$lag_val" 2>/dev/null)
-            [[ "$lag_int" =~ ^-?[0-9]+$ ]] || lag_int=0
-            ((lag_int < 0)) && lag_int=0
-            lag="$lag_int"
+          NETWORK_HEIGHT_NUM="$(normalize_block "$NETWORK_HEIGHT")"
+          LATEST_BLOCK_NUM="$(normalize_block "$latest_block")"
+          if [[ "$NETWORK_HEIGHT_NUM" =~ ^[0-9]+$ && "$LATEST_BLOCK_NUM" =~ ^[0-9]+$ ]]; then
+            lag_val=$((NETWORK_HEIGHT_NUM - LATEST_BLOCK_NUM))
+            ((lag_val < 0)) && lag_val=0
+            lag="$lag_val"
           fi
 
           # Status
           if [[ -z "$mine_flag" ]]; then
             status_raw="SYNC-ONLY"
-          elif [[ "$lag" =~ ^[0-9]+$ && "$lag_int" -eq 0 ]]; then
+          elif [[ "$lag" =~ ^[0-9]+$ && "$lag" -eq 0 ]]; then
             status_raw="MINING"
           else
             status_raw="SYNCING"
           fi
         fi
 
-        # Only run LastProof | AvgProof if MINING; else, set to '--'
+        # Only run LastProof | AvgProof | Proof/s if MINING; else, set to '--'
         if [[ "${status_raw^^}" == "MINING" ]]; then
           proof_metrics=$(update_proof_durations "$session")
-          IFS='|' read -r last_comp avg_comp <<<"$proof_metrics"
+          # echo "[DEBUG] update_proof_durations for $session at $(date +'%Y-%m-%d %H:%M:%S.%3N')" >>/tmp/launcher_monitor_timing.log
+          IFS='|' read -r last_comp avg_comp proofs_per_sec <<<"$proof_metrics"
           last_comp=${last_comp:-"--"}
           avg_comp=${avg_comp:-"--"}
+          proofs_per_sec=${proofs_per_sec:-"--"}
         else
           last_comp="--"
           avg_comp="--"
+          proofs_per_sec="--"
         fi
 
         # Only skip get_block_deltas if miner is INACTIVE; run for MINING and SYNC ONLY
@@ -2196,25 +2282,9 @@ EOS
           avg_blk="--"
         else
           block_metrics=$(get_block_deltas "$session")
+          # get_block_deltas for $session at $(date +'%Y-%m-%d %H:%M:%S.%3N')" >>/tmp/launcher_monitor_timing.log
           IFS='|' read -r last_blk avg_blk <<<"$block_metrics"
         fi
-
-        # Only compute for real mining miners (after status_raw is set)
-        avg_proof_time="--"
-        proofs_per_sec="--"
-        if [[ "$status_raw" == "MINING" ]]; then
-          if type update_proof_attempts_log &>/dev/null; then
-            update_proof_attempts_log "$session" 2>/dev/null || true
-          fi
-          if type get_avg_proof_time_and_proofs_per_sec &>/dev/null; then
-            read avg_proof_time proofs_per_sec < <(get_avg_proof_time_and_proofs_per_sec "$session" 2>/dev/null) || true
-          fi
-          [[ -z "$avg_proof_time" ]] && avg_proof_time="--"
-          [[ -z "$proofs_per_sec" ]] && proofs_per_sec="--"
-        fi
-        avg_proof_time_s=$(add_s "$avg_proof_time")
-        avg_proof_time_display=$(pad_plain "${YELLOW}${avg_proof_time_s}${RESET}" 13)
-        proofs_per_sec_display=$(pad_plain "${CYAN}${proofs_per_sec}${RESET}" 13)
 
         # Miner name coloring
         session_padded=$(printf "%-9s" "$session")
@@ -2249,8 +2319,8 @@ EOS
         [[ -z "$status_raw" ]] && status_raw="SYNCING"
 
         uptime_padded=$(printf "%-9s" "$readable")
-        cpu_padded=$(printf "%-9s" "${cpu}%")
-        mem_padded=$(printf "%-9s" "${mem}%")
+        cpu_padded=$(printf "%-6s" "${cpu}%")
+        mem_padded=$(printf "%-6s" "${mem}%")
         ram_padded=$(printf "%-9s" "$mem_gb")
         block_padded=$(printf "%-9s" "$latest_block")
         lag_padded=$(printf "%-5s" "$lag")
@@ -2332,11 +2402,12 @@ EOS
         # Pad all columns to fixed width
         last_comp_display=$(pad_plain "$last_comp_colored" 9)
         avg_comp_display=$(pad_plain "$avg_comp_colored" 9)
+        proofs_per_sec_display=$(pad_plain "${CYAN}${proofs_per_sec}${RESET}" 9)
         blk_age_display=$(pad_plain "$blk_age_colored" 9)
         avg_blk_display=$(pad_plain "$avg_blk_colored" 9)
 
-        printf "%b | %b | %b | %b | %b | %b | %b | %b | %b | %b | %b | %b | %b | %b | %b | %b\n" \
-          "$icon" "$session_display" "$uptime_display" "$cpu_display" "$mem_display" "$ram_display" "$block_display" "$lag_display" "$status_display" "$peer_display" "$last_comp_display" "$avg_comp_display" "$avg_proof_time_display" "$proofs_per_sec_display" "$blk_age_display" "$avg_blk_display"
+        printf "%b | %b | %b | %b | %b | %b | %b | %b | %b | %b | %b | %b | %b | %b | %b\n" \
+          "$icon" "$session_display" "$uptime_display" "$cpu_display" "$mem_display" "$ram_display" "$block_display" "$lag_display" "$status_display" "$peer_display" "$last_comp_display" "$avg_comp_display" "$proofs_per_sec_display" "$blk_age_display" "$avg_blk_display"
       done
 
       echo ""
@@ -2577,7 +2648,7 @@ EXTRA_FLAGS=$(awk -v section="[miner$id]" '
 # --- END PATCH: Extract EXTRA_FLAGS ---
 
 export MINIMAL_LOG_FORMAT=true
-export RUST_LOG=info,nockchain=info,nockchain_libp2p_io=info,libp2p=info,libp2p_quic=info
+export RUST_LOG=debug,nockchain=debug,nockchain_libp2p_io=info,libp2p=info,libp2p_quic=info
 
 LOGFILE="miner${id}.log"
 if [ -e "$LOGFILE" ]; then
@@ -2633,6 +2704,16 @@ EOS
         [[ "$USE_EXISTING_CFG" == "1" || "$USE_EXISTING_CFG" == "2" ]] && break
         echo -e "${RED}❌ Invalid input. Please enter 1 or 2.${RESET}"
       done
+      # Auto-detect NUM_MINERS from existing launch.cfg if keeping config
+      if [[ "$USE_EXISTING_CFG" == "1" ]]; then
+        LAUNCH_CFG="$SCRIPT_DIR/launch.cfg"
+        if [[ -f "$LAUNCH_CFG" ]]; then
+          NUM_MINERS=$(grep -c '^\[miner[0-9]\+\]' "$LAUNCH_CFG")
+        else
+          echo -e "${RED}❌ launch.cfg not found. Cannot determine number of miners.${RESET}"
+          continue
+        fi
+      fi
     else
       USE_EXISTING_CFG=2
     fi
