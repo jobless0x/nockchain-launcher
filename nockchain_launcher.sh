@@ -304,98 +304,113 @@ update_proof_durations() {
   local miner="$1"
   local log_file="$NOCKCHAIN_HOME/$miner/$miner.log"
   local proof_csv="$NOCKCHAIN_HOME/$miner/${miner}_proof_log.csv"
-  local last_csv_line=""
+  local max_entries=100
 
-  # Ensure miner directory exists
   [[ -d "$NOCKCHAIN_HOME/$miner" ]] || mkdir -p "$NOCKCHAIN_HOME/$miner"
+  [[ -f "$log_file" ]] || { echo "--|--|--"; return; }
 
-  # If log file doesn't exist, return dashes
-  [[ -f "$log_file" ]] || {
-    echo "--|--|--"
-    return
-  }
-
-  # Ensure CSV exists and has header
-  if [[ ! -f "$proof_csv" ]]; then
-    echo "thread,start_time,finish_time,duration_s" >"$proof_csv"
-    sync "$proof_csv"
+  # Get latest CSV row as key
+  local latest_csv_row=""
+  if [[ -f "$proof_csv" ]]; then
+    latest_csv_row=$(tail -n 1 "$proof_csv")
+    [[ "$latest_csv_row" == "thread,start_time,finish_time,duration_s" ]] && latest_csv_row=""
+  fi
+  local latest_key=""
+  if [[ -n "$latest_csv_row" ]]; then
+    latest_key=$(echo "$latest_csv_row" | awk -F, '{print $1"|"$2"|"$3"|"$4}')
   fi
 
-  # Determine last processed finish_time and thread from CSV (for incremental parsing)
-  last_csv_line=$(tail -n 1 "$proof_csv" 2>/dev/null)
-  last_finish_time=$(echo "$last_csv_line" | awk -F, '{print $3}')
-  last_thread=$(echo "$last_csv_line" | awk -F, '{print $1}')
+  # Read the newest 1000 lines, newest first
+  mapfile -t log_lines < <(tail -n 1000 "$log_file" | tac)
 
-  # Holds the latest "starting mining attempt" time per thread
-  declare -A thread_last_start_time
+  declare -a new_rows=()
+  local count=0
 
-  # For very large logs, avoid O(n²) grep: process in one loop
-  mapfile -t log_lines < <(sed 's/\x1B\[[0-9;]*[a-zA-Z]//g' "$log_file" | tail -n 5000)
-
-  for ((i = 0; i < ${#log_lines[@]}; ++i)); do
-    line="${log_lines[i]}"
-    # Early skip: ignore lines up to and including last processed finish_time/thread
-    if [[ "$line" =~ didn\'t\ find\ block,\ starting\ new\ attempt.\ thread=([0-9]+) ]]; then
-      this_thread="${BASH_REMATCH[1]}"
-      if [[ "$line" =~ \(([0-9]{2}:[0-9]{2}:[0-9]{2})\) ]]; then
-        this_finish="${BASH_REMATCH[1]}"
-        if [[ "$this_thread" == "$last_thread" && "$this_finish" == "$last_finish_time" ]]; then
-          found_last=1
-        fi
-      fi
-      continue
-    fi
-
-    # After we've found last, only parse new
-    if [[ "$line" =~ starting\ mining\ attempt\ on\ thread\ ([0-9]+) ]]; then
-      thread="${BASH_REMATCH[1]}"
-      if [[ "$line" =~ \(([0-9]{2}:[0-9]{2}:[0-9]{2})\) ]]; then
-        thread_last_start_time["$thread"]="${BASH_REMATCH[1]}"
-      fi
-      continue
-    fi
-
+  for ((i=0; i<${#log_lines[@]} && count<max_entries; ++i)); do
+    line="${log_lines[$i]}"
+    # Is this a finish?
     if [[ "$line" =~ didn\'t\ find\ block,\ starting\ new\ attempt.\ thread=([0-9]+) ]]; then
       thread="${BASH_REMATCH[1]}"
       if [[ "$line" =~ \(([0-9]{2}:[0-9]{2}:[0-9]{2})\) ]]; then
         finish_time="${BASH_REMATCH[1]}"
-        start_time="${thread_last_start_time[$thread]:-}"
-        if [[ -n "$start_time" ]]; then
-          start_epoch=$(date -d "$start_time" +%s 2>/dev/null)
-          finish_epoch=$(date -d "$finish_time" +%s 2>/dev/null)
-          if [[ -n "$start_epoch" && -n "$finish_epoch" && "$finish_epoch" -ge "$start_epoch" ]]; then
-            duration=$((finish_epoch - start_epoch))
-            if ! grep -q "^$thread,$start_time,$finish_time,$duration\$" "$proof_csv"; then
-              echo "$thread,$start_time,$finish_time,$duration" >>"$proof_csv"
-              sync "$proof_csv"
+        # Search upwards (i+1, i+2...) for matching start for same thread
+        for ((j=i+1; j<${#log_lines[@]}; ++j)); do
+          start_line="${log_lines[$j]}"
+          if [[ "$start_line" =~ starting\ mining\ attempt\ on\ thread\ $thread ]] && [[ "$start_line" =~ \(([0-9]{2}:[0-9]{2}:[0-9]{2})\) ]]; then
+            start_time="${BASH_REMATCH[1]}"
+
+            # Convert to epoch seconds (midnight rollover safe)
+            start_epoch=$(date -d "1970-01-01 $start_time" +%s 2>/dev/null)
+            finish_epoch=$(date -d "1970-01-01 $finish_time" +%s 2>/dev/null)
+            if [[ -n "$start_epoch" && -n "$finish_epoch" ]]; then
+              if (( finish_epoch < start_epoch )); then
+                finish_epoch=$((finish_epoch + 86400)) # +24h for midnight rollover
+              fi
+              duration=$((finish_epoch - start_epoch))
+              row="$thread,$start_time,$finish_time,$duration"
+              key="$thread|$start_time|$finish_time|$duration"
+              # Check duplicate with only the latest CSV row
+              if [[ -n "$latest_key" && "$key" == "$latest_key" ]]; then
+                break 2 # Exit both loops
+              fi
+              new_rows+=("$row")
+              count=$((count + 1))
             fi
+            break # Only one match per finish
           fi
-        fi
+        done
       fi
-      continue
     fi
   done
 
-  # Summarize for dashboard: exclude header
+  # Merge with old CSV, dedupe, keep only latest 100 (oldest to newest)
+  declare -a old_csv_rows=()
+  if [[ -f "$proof_csv" ]]; then
+    while IFS= read -r line; do
+      [[ "$line" == "thread,start_time,finish_time,duration_s" ]] && continue
+      [[ -z "$line" ]] && continue
+      old_csv_rows+=("$line")
+    done < "$proof_csv"
+  fi
+
+  declare -a all_rows=("${old_csv_rows[@]}" "${new_rows[@]}")
+  declare -A seen
+  declare -a unique_rows=()
+  for ((i=${#all_rows[@]}-1; i>=0; --i)); do
+    row="${all_rows[$i]}"
+    key=$(echo "$row" | awk -F, '{print $1"|"$2"|"$3"|"$4}')
+    if [[ -n "$row" && -z "${seen["$key"]+set}" ]]; then
+      seen["$key"]=1
+      unique_rows+=("$row")
+    fi
+  done
+  # Sort by finish_time (column 3), oldest to newest
+  IFS=$'\n' sorted_rows=($(printf "%s\n" "${unique_rows[@]}" | sort -t, -k3,3))
+  unset IFS
+  total=${#sorted_rows[@]}
+  if (( total > max_entries )); then
+    sorted_rows=("${sorted_rows[@]: -$max_entries}")
+  fi
+
+  # Write CSV
+  echo "thread,start_time,finish_time,duration_s" >"$proof_csv"
+  for row in "${sorted_rows[@]}"; do
+    echo "$row" >>"$proof_csv"
+  done
+
+  # Dashboard output (same as before)
   last_duration="--"
   avg_duration="--"
   proofs_per_sec="--"
-
-  nrows=$(wc -l <"$proof_csv" 2>/dev/null)
-  if ((nrows > 1)); then
-    # Last duration
-    last_duration=$(tail -n 1 "$proof_csv" | awk -F, '{print $4}')
-
-    # Average duration
-    mapfile -t durations < <(tail -n 50 "$proof_csv" | awk -F, '{print $4}' | grep -E '^[0-9]+$')
-    if [[ ${#durations[@]} -gt 0 ]]; then
-      sum=0
-      for d in "${durations[@]}"; do sum=$((sum + d)); done
-      avg_duration=$(awk -v s="$sum" -v n="${#durations[@]}" 'BEGIN{printf "%.2f", s/n}')
-    fi
-
-    # Proofs/s over last 50 entries, using all start_times (regardless of thread)
-    mapfile -t start_times < <(tail -n 50 "$proof_csv" | awk -F, '{print $2}' | grep -E '^[0-9]{2}:[0-9]{2}:[0-9]{2}$')
+  if (( ${#sorted_rows[@]} > 0 )); then
+    last_duration=$(echo "${sorted_rows[-1]}" | awk -F, '{print $4}')
+    sum=0
+    for row in "${sorted_rows[@]}"; do
+      d=$(echo "$row" | awk -F, '{print $4}')
+      sum=$((sum + d))
+    done
+    avg_duration=$(awk -v s="$sum" -v n="${#sorted_rows[@]}" 'BEGIN{printf "%.2f", s/n}')
+    mapfile -t start_times < <(for row in "${sorted_rows[@]}"; do echo "$row" | awk -F, '{print $2}'; done)
     count=${#start_times[@]}
     if ((count > 1)); then
       first_sec=$(date -d "${start_times[0]}" +%s 2>/dev/null)
@@ -2221,13 +2236,13 @@ EOS
             blk="--"
             if [[ -f "$log_file" && -r "$log_file" ]]; then
               blk=$(extract_latest_block "$log_file")
-              # echo "[DEBUG] extract_latest_block for $session at $(date +'%Y-%m-%d %H:%M:%S.%3N')" >>/tmp/launcher_monitor_timing.log
+              echo "[DEBUG] extract_latest_block for $session at $(date +'%Y-%m-%d %H:%M:%S.%3N')" >>/tmp/launcher_monitor_timing.log
             fi
             blk_num="$(normalize_block "$blk")"
-            # echo "[DEBUG] normalize_block for $session at $(date +'%Y-%m-%d %H:%M:%S.%3N')" >>/tmp/launcher_monitor_timing.log
+            echo "[DEBUG] normalize_block for $session at $(date +'%Y-%m-%d %H:%M:%S.%3N')" >>/tmp/launcher_monitor_timing.log
             if [[ -n "$blk_num" && "$blk_num" != "" ]]; then
               latest_block="$(format_block_dotted "$blk_num")"
-              # echo "[DEBUG] format_block_dotted for $session at $(date +'%Y-%m-%d %H:%M:%S.%3N')" >>/tmp/launcher_monitor_timing.log
+              echo "[DEBUG] format_block_dotted for $session at $(date +'%Y-%m-%d %H:%M:%S.%3N')" >>/tmp/launcher_monitor_timing.log
             else
               latest_block="--"
             fi
@@ -2265,7 +2280,7 @@ EOS
         # Only run LastProof | AvgProof | Proof/s if MINING; else, set to '--'
         if [[ "${status_raw^^}" == "MINING" ]]; then
           proof_metrics=$(update_proof_durations "$session")
-          # echo "[DEBUG] update_proof_durations for $session at $(date +'%Y-%m-%d %H:%M:%S.%3N')" >>/tmp/launcher_monitor_timing.log
+          echo "[DEBUG] update_proof_durations for $session at $(date +'%Y-%m-%d %H:%M:%S.%3N')" >>/tmp/launcher_monitor_timing.log
           IFS='|' read -r last_comp avg_comp proofs_per_sec <<<"$proof_metrics"
           last_comp=${last_comp:-"--"}
           avg_comp=${avg_comp:-"--"}
